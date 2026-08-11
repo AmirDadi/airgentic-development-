@@ -91,6 +91,14 @@ after the fact. Each phase is still a shippable increment with its own exit
 criterion, and control (P5) still lands after the read-only and live-view
 layers (P1–P4) are proven, per the risk this carries (see R5 below).
 
+- **P0 — Project structure**: scaffold the repo — `backend/` (Fastify +
+  TypeScript service, SQLite via `better-sqlite3`), `frontend/` (Vite +
+  React + Tailwind), shared lint/format config, `.gitignore`, root README
+  describing layout and how to run both services locally. No features yet;
+  this just gives every later phase a place to land code.
+  *Exit: `backend` boots an empty Fastify server and `frontend` boots an
+  empty Vite dev server, both from a fresh clone with one install command
+  each.*
 - **P1 — Read-only MVP**: liveness + pipeline collectors, SQLite, REST + SSE,
   Team board + Pipeline views, Tailscale-vs-Caddy decision.
   *Exit: open the page, see truthfully who's alive and every feature's stage
