@@ -1,8 +1,12 @@
-import Fastify from "fastify";
+import Database from "better-sqlite3";
+import { buildApp } from "./app.js";
+import { migrate } from "./db.js";
 
-const app = Fastify({ logger: true });
+const dbPath = process.env.DB_PATH ?? "dashboard.db";
+const db = new Database(dbPath);
+migrate(db);
 
-app.get("/health", async () => ({ status: "ok" }));
+const app = buildApp(db, { logger: true });
 
 const port = Number(process.env.PORT ?? 8787);
 
