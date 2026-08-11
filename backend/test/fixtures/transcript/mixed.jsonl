@@ -1,0 +1,10 @@
+{"type":"assistant","timestamp":"2026-08-11T12:00:00.000Z","sessionId":"s-mix","uuid":"m0000000-0000-4000-8000-000000000001","message":{"role":"assistant","content":[{"type":"text","text":"Starting the mixed run."}]}}
+{not json at all
+{"type":"assistant","timestamp":"2026-08-11T12:00:02.000Z","sessionId":"s-mix","uuid":"m0000000-0000-4000-8000-000000000002","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_20","name":"Read","input":{"file_path":"/home/dev/proj/backend/src/types.ts"}}]}}
+
+{"schemaVersion":9,"kind":"agent.turn.delta","payload":{"segments":[]}}
+{"type":"assistant","timestamp":"2026-08-11T12:00:05.000Z","sessionId":"s-mix","uuid":"m0000000-0000-4000-8000-000000000003","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_21","name":"SendMessage","input":{"recipient":"frontend-lead","message":"Types are stable now."}}]}}
+
+{"type":"user","timestamp":"2026-08-11T12:00:07.000Z","sessionId":"s-mix","uuid":"m0000000-0000-4000-8000-000000000004","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_22","content":[{"type":"text","text":"[message from frontend-lead] Acknowledged, wiring the view."}]}]}}
+}{ still not json
+{"type":"result","subtype":"success","timestamp":"2026-08-11T12:00:09.000Z","sessionId":"s-mix","uuid":"m0000000-0000-4000-8000-000000000005","is_error":false}
