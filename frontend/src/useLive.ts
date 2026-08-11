@@ -37,11 +37,15 @@ export function useLive(opts: UseLiveOptions): { connected: boolean } {
   const factoryRef = useRef(factory);
 
   useEffect(() => {
-    const create =
-      factoryRef.current ??
-      ((u: string) => new EventSource(u) as unknown as EventSourceLike);
+    const create = factoryRef.current;
 
-    const source = create(url);
+    // No injected factory and no EventSource in this environment (jsdom, SSR,
+    // an old browser): render from the REST snapshot rather than throwing.
+    if (!create && typeof EventSource === "undefined") return;
+
+    const source = create
+      ? create(url)
+      : (new EventSource(url) as unknown as EventSourceLike);
 
     source.addEventListener("open", () => setConnected(true));
     source.addEventListener("error", () => setConnected(false));

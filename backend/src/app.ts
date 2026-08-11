@@ -137,6 +137,13 @@ export function buildApp(
       "x-accel-buffering": "no",
     });
 
+    // writeHead only queues the headers — without this a real client sees
+    // nothing at all until the first write, i.e. until the 30s heartbeat.
+    // Send an opening comment too, so proxies that buffer until first body
+    // byte release the response immediately.
+    reply.raw.flushHeaders();
+    reply.raw.write(": connected\n\n");
+
     const unsubscribe = hub.subscribe((event, data) => {
       reply.raw.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
     });

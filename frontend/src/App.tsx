@@ -1,7 +1,125 @@
-export default function App() {
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { createApi, type ApiClient } from "./api";
+import { useLive, type EventSourceFactory } from "./useLive";
+import { TeamBoard } from "./components/TeamBoard";
+import { PipelineBoard } from "./components/PipelineBoard";
+import { Conversations } from "./components/Conversations";
+import type { Agent, Feature, Thread } from "./types";
+
+const TABS = [
+  { id: "team", label: "Team" },
+  { id: "pipeline", label: "Pipeline" },
+  { id: "conversations", label: "Conversations" },
+] as const;
+
+type TabId = (typeof TABS)[number]["id"];
+
+export interface AppProps {
+  /** Injected in tests; defaults to the real HTTP client. */
+  api?: ApiClient;
+  /** Injected in tests; defaults to a real EventSource. */
+  liveFactory?: EventSourceFactory;
+  /** Injected so stalled-agent rendering is deterministic under test. */
+  now?: number;
+}
+
+export default function App({ api, liveFactory, now }: AppProps = {}) {
+  const client = useMemo(() => api ?? createApi(), [api]);
+
+  const [tab, setTab] = useState<TabId>("team");
+  const [agents, setAgents] = useState<Agent[]>([]);
+  const [features, setFeatures] = useState<Feature[]>([]);
+  const [threads, setThreads] = useState<Thread[]>([]);
+  const [selectedThreadId, setSelectedThreadId] = useState<string>();
+  const [error, setError] = useState<string>();
+
+  // Initial snapshot over REST. The SSE channel only carries deltas, so
+  // without this the board would stay empty until something changed.
+  useEffect(() => {
+    let cancelled = false;
+
+    (async () => {
+      try {
+        const [a, f, t] = await Promise.all([
+          client.agents(),
+          client.features(),
+          client.threads() as Promise<Thread[]>,
+        ]);
+        if (cancelled) return;
+        setAgents(a);
+        setFeatures(f);
+        setThreads(t);
+        setError(undefined);
+      } catch {
+        if (!cancelled) setError("Backend unreachable — showing no data.");
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [client]);
+
+  const onEvent = useCallback((type: string, data: unknown) => {
+    if (type === "agents") setAgents(data as Agent[]);
+    else if (type === "features") setFeatures(data as Feature[]);
+    else if (type === "messages") setThreads(data as Thread[]);
+  }, []);
+
+  const { connected } = useLive({ onEvent, factory: liveFactory });
+
+  const selected = selectedThreadId ?? threads[0]?.id;
+
   return (
-    <main className="min-h-screen flex items-center justify-center">
-      <h1 className="text-xl font-semibold">Agent Team Dashboard</h1>
-    </main>
+    <div className="min-h-screen bg-slate-50 text-slate-900">
+      <header className="border-b border-slate-200 bg-white px-4 py-3">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <h1 className="text-lg font-semibold">Agent Team Dashboard</h1>
+          <span
+            className="text-xs text-slate-500"
+            role="status"
+            aria-label={connected ? "live updates connected" : "live updates disconnected"}
+          >
+            {connected ? "● live" : "○ offline"}
+          </span>
+        </div>
+
+        <div role="tablist" aria-label="Views" className="mt-3 flex gap-1">
+          {TABS.map((t) => (
+            <button
+              key={t.id}
+              role="tab"
+              aria-selected={tab === t.id}
+              onClick={() => setTab(t.id)}
+              className={`rounded px-3 py-1.5 text-sm ${
+                tab === t.id
+                  ? "bg-slate-900 text-white"
+                  : "bg-slate-100 text-slate-700 hover:bg-slate-200"
+              }`}
+            >
+              {t.label}
+            </button>
+          ))}
+        </div>
+      </header>
+
+      {error && (
+        <p role="alert" className="m-4 rounded bg-amber-100 px-3 py-2 text-sm text-amber-900">
+          {error}
+        </p>
+      )}
+
+      <main className="p-4">
+        {tab === "team" && <TeamBoard agents={agents} now={now ?? Date.now()} />}
+        {tab === "pipeline" && <PipelineBoard features={features} />}
+        {tab === "conversations" && (
+          <Conversations
+            threads={threads}
+            selectedThreadId={selected}
+            onSelectThread={setSelectedThreadId}
+          />
+        )}
+      </main>
+    </div>
   );
 }

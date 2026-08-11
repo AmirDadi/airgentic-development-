@@ -27,3 +27,23 @@ export interface Feature {
   pr_url: string | null;
   updated_at: number;
 }
+
+export type MessageChannel = "inter_agent" | "human_web";
+
+export interface Message {
+  id: string;
+  ts: number;
+  from_agent: string;
+  to_agent: string;
+  channel: MessageChannel;
+  body: string;
+  session_id: string | null;
+}
+
+export interface Thread {
+  id: string;
+  participants: [string, string];
+  messages: Message[];
+  last_ts: number;
+  last_body: string;
+}

@@ -1,5 +1,9 @@
 import { describe, it, expect, vi } from "vitest";
+import Database from "better-sqlite3";
+import type { AddressInfo } from "node:net";
 import { createSseHub } from "../src/sse.js";
+import { buildApp } from "../src/app.js";
+import { migrate } from "../src/db.js";
 
 describe("createSseHub", () => {
   it("delivers a broadcast to a single subscriber", () => {
@@ -134,5 +138,41 @@ describe("createSseHub", () => {
 
     expect(send).not.toHaveBeenCalled();
     expect(two.subscriberCount()).toBe(0);
+  });
+});
+
+describe("GET /live over a real socket", () => {
+  // app.inject() resolves as soon as headers are queued, so it cannot catch a
+  // response whose headers are never flushed to the wire. This boots a real
+  // listener: before flushHeaders() was added, a client saw zero bytes until
+  // the 30s heartbeat.
+  it("flushes headers and an opening frame immediately on connect", async () => {
+    const db = new Database(":memory:");
+    migrate(db);
+    const app = buildApp(db);
+    await app.listen({ port: 0, host: "127.0.0.1" });
+    const { port } = app.server.address() as AddressInfo;
+
+    try {
+      const controller = new AbortController();
+      const res = await fetch(`http://127.0.0.1:${port}/live`, {
+        signal: controller.signal,
+      });
+
+      expect(res.headers.get("content-type")).toContain("text/event-stream");
+
+      const reader = res.body!.getReader();
+      const first = await Promise.race([
+        reader.read().then((r) => new TextDecoder().decode(r.value)),
+        new Promise<string>((_, rej) =>
+          setTimeout(() => rej(new Error("no bytes within 2s")), 2000),
+        ),
+      ]);
+      expect(first).toContain(":");
+
+      controller.abort();
+    } finally {
+      await app.close();
+    }
   });
 });
