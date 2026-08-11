@@ -138,6 +138,17 @@ describe("messages", () => {
     expect(pair.map((m) => m.id).sort()).toEqual(["m1", "m2"]);
   });
 
+  it("filters to one agent's messages when only `a` is given", () => {
+    // Regression: the pair filter required BOTH a and b, so `?a=lead` alone
+    // silently returned every message in the table rather than that agent's.
+    insertMessage(db, message({ id: "m1", from_agent: "lead", to_agent: "payments" }));
+    insertMessage(db, message({ id: "m2", from_agent: "payments", to_agent: "lead" }));
+    insertMessage(db, message({ id: "m3", from_agent: "search", to_agent: "docs" }));
+
+    const mine = listMessages(db, { a: "lead" });
+    expect(mine.map((m) => m.id).sort()).toEqual(["m1", "m2"]);
+  });
+
   it("returns messages oldest-first and honours a limit", () => {
     insertMessage(db, message({ id: "m1", ts: 30 }));
     insertMessage(db, message({ id: "m2", ts: 10 }));

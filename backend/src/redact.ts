@@ -125,9 +125,12 @@ const RULES: readonly Rule[] = [
   // ("Bearer of bad news") out.
   {
     name: "bearer-token",
+    // Case-insensitive: curl -H, Go and Python HTTP clients all emit a
+    // lowercase `bearer`, and a case-sensitive rule leaked those tokens
+    // verbatim into storage. The 16-char floor still keeps prose out.
     re: new RegExp(
       String.raw`\b(Bearer\s+)` + NOT_MARKER + String.raw`[A-Za-z0-9._~+/=-]{16,}`,
-      "g",
+      "gi",
     ),
     replace: (_m, prefix) => `${prefix}${marker("bearer-token")}`,
   },

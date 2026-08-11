@@ -119,6 +119,12 @@ export function listMessages(
                 OR (from_agent = @b AND to_agent = @a)`;
     params.a = q.a;
     params.b = q.b;
+  } else if (q.a || q.b) {
+    // One agent named: everything they sent or received. Previously this fell
+    // through to no filter at all, silently returning the whole table.
+    const only = q.a ?? q.b;
+    where = `WHERE from_agent = @only OR to_agent = @only`;
+    params.only = only;
   }
 
   if (q.limit === undefined) {

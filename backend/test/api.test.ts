@@ -318,6 +318,46 @@ describe("GET /threads", () => {
   });
 });
 
+describe("POST /ingest redaction", () => {
+  // PRD R4: hook payloads are transcript-derived, so a secret an agent saw can
+  // ride in on one. Previously payloads were stored and served verbatim.
+  it("redacts secrets nested anywhere in the payload before storing", async () => {
+    const db = new Database(":memory:");
+    migrate(db);
+    const app = buildApp(db);
+
+    const secret = "ghp_FAKEfake0123456789ABCDefghij0123AB";
+    await app.inject({
+      method: "POST",
+      url: "/ingest",
+      payload: {
+        agent: "payments",
+        type: "tool_call",
+        payload: { cmd: `curl -H "authorization: bearer ${secret}"`, deep: { note: secret } },
+      },
+    });
+
+    const raw = JSON.stringify(await app.inject({ method: "GET", url: "/events" }).then((r) => r.json()));
+    expect(raw).not.toContain(secret);
+    expect(raw).toContain("[REDACTED:");
+  });
+
+  it("leaves non-string payload values structurally intact", async () => {
+    const db = new Database(":memory:");
+    migrate(db);
+    const app = buildApp(db);
+
+    await app.inject({
+      method: "POST",
+      url: "/ingest",
+      payload: { type: "metrics", payload: { count: 42, ok: true, items: ["a", "b"], none: null } },
+    });
+
+    const [event] = await app.inject({ method: "GET", url: "/events" }).then((r) => r.json());
+    expect(event.payload).toEqual({ count: 42, ok: true, items: ["a", "b"], none: null });
+  });
+});
+
 describe("POST /ingest", () => {
   it("persists a valid event and returns 201 with it", async () => {
     const { app } = makeApp();
@@ -419,7 +459,9 @@ describe("POST /ingest", () => {
 
     expect(send).toHaveBeenCalledTimes(1);
     const [name, data] = send.mock.calls[0] as [string, { id: string }];
-    expect(name).toBe("event");
+    // Must match frontend useLive.ts CHANNELS; "event" singular meant the
+    // browser's addEventListener("events", …) never fired.
+    expect(name).toBe("events");
     expect(data.id).toBe(created.id);
   });
 

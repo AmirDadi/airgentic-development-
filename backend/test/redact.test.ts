@@ -140,6 +140,18 @@ describe("redact — individual patterns", () => {
     expect(hits).toContain("jwt");
   });
 
+  // Regression: the rule was case-sensitive, so a lowercase `bearer` — emitted
+  // by curl -H, Go and Python HTTP clients, and common in logs — leaked the
+  // token verbatim into storage.
+  it.each(["Bearer", "bearer", "BEARER", "BeArEr"])(
+    "redacts %s tokens regardless of header casing",
+    (word) => {
+      const out = redact(`Authorization: ${word} ${FAKE.bearer}`);
+      expect(out).not.toContain(FAKE.bearer);
+      expect(out).toContain("[REDACTED:bearer-token]");
+    },
+  );
+
   it("redacts the token in an Authorization: Bearer header", () => {
     const { text, hits } = redactWithReport(
       `Authorization: Bearer ${FAKE.bearer}`,

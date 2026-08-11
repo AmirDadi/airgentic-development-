@@ -11,6 +11,26 @@ import {
 import { groupIntoThreads } from "./threads.js";
 import type { Event } from "./types.js";
 import { createSseHub, type SseHub } from "./sse.js";
+import { redact } from "./redact.js";
+
+/**
+ * Redacts every string inside an arbitrary hook payload, preserving structure.
+ * Hook payloads are transcript-derived, so a credential an agent saw can ride
+ * in on one; PRD R4 requires it never reaches storage in the clear.
+ */
+function redactDeep(value: unknown): unknown {
+  if (typeof value === "string") return redact(value);
+  if (Array.isArray(value)) return value.map(redactDeep);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(([k, v]) => [
+        k,
+        redactDeep(v),
+      ]),
+    );
+  }
+  return value;
+}
 
 export interface BuildAppOptions {
   /** Injectable so tests can observe fan-out without opening a socket. */
@@ -116,11 +136,13 @@ export function buildApp(
         ts: Date.now(),
         agent: req.body.agent ?? null,
         type: req.body.type,
-        payload: req.body.payload ?? null,
+        payload: redactDeep(req.body.payload ?? null),
       };
 
       insertEvent(db, event);
-      hub.broadcast("event", event);
+      // Event name must match what the frontend subscribes to (see
+      // useLive.ts CHANNELS) — "event" singular was never received.
+      hub.broadcast("events", event);
 
       return reply.code(201).send(event);
     },
