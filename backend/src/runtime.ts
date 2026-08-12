@@ -23,6 +23,7 @@ import { groupIntoThreads } from "./threads.js";
 import type { SseHub } from "./sse.js";
 import { collectLiveness, type CommandRunner } from "./collectors/liveness.js";
 import { collectPipeline, type PrInfo } from "./collectors/pipeline.js";
+import { createGithubPrSource } from "./github.js";
 import {
   collectTranscripts,
   createTranscriptState,
@@ -109,14 +110,46 @@ export function defaultListBranches(
 }
 
 /**
- * No PR lookup by default.
+ * PR lookup, from the GitHub REST API.
  *
- * A real implementation needs a forge client and credentials (`gh pr list`, or
- * the GitHub API with a token) which is out of scope for P1/P2 — the stage
- * machine degrades gracefully to the artifact/branch signals without it. This
- * is the seam where that lookup gets injected once it exists.
+ * Configuration (env, both optional):
+ *   GITHUB_REPO   "owner/repo" to poll for PRs. UNSET = no PR lookup at all,
+ *                  which is the supported zero-config mode: the stage machine
+ *                  degrades to the artifact/branch signals and the dashboard
+ *                  still boots on a machine with no forge access.
+ *   GITHUB_TOKEN  PAT used for the API. Omit for a public repo; without it the
+ *                  poll shares the 60 req/hr anonymous rate limit.
+ *
+ * Read once at module load, on purpose: the poll cadence must not re-read env
+ * (and re-build the client) every ten seconds. The source itself never throws
+ * and returns its last known good snapshot on failure — see `github.ts`.
  */
-export const defaultListPrs = async (): Promise<Record<string, PrInfo>> => ({});
+export const defaultListPrs: () => Promise<Record<string, PrInfo>> = (() => {
+  const repo = process.env.GITHUB_REPO?.trim();
+  if (repo === undefined || repo.length === 0) {
+    return async (): Promise<Record<string, PrInfo>> => ({});
+  }
+  const token = process.env.GITHUB_TOKEN?.trim();
+  return createGithubPrSource({
+    repo,
+    token: token !== undefined && token.length > 0 ? token : undefined,
+    // Polls every 10s, so log the FIRST failure and then only when the reason
+    // changes: a bad token must be visible, but must not fill the log.
+    onError: (() => {
+      let last = "";
+      return (err: { status?: number; message: string }): void => {
+        const key = `${err.status ?? ""}:${err.message}`;
+        if (key === last) return;
+        last = key;
+        console.warn(
+          `[dashboard] GitHub PR lookup for ${repo} failed: ${err.message}. ` +
+            `Pipeline stages in_review/merge_ready/merged will not appear ` +
+            `until this is fixed.`,
+        );
+      };
+    })(),
+  });
+})();
 
 /** Channels the frontend subscribes to. Renaming one silently breaks the UI. */
 const CHANNEL_AGENTS = "agents";
