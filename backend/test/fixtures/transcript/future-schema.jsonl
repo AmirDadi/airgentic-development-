@@ -1,0 +1,6 @@
+{"schemaVersion":9,"kind":"agent.turn.delta","at":1786500000000,"payload":{"segments":[{"variant":"prose","value":"a shape from a future Claude Code release"}]}}
+{"v":2,"event":"model_stream","data":{"blocks":[{"b":"txt","s":"totally renamed fields"}]},"emittedAt":"2026-12-01T00:00:00.000Z"}
+{"type":"assistant","timestamp":"2027-01-01T00:00:00.000Z","message":{"role":"assistant","parts":[{"partType":"reasoning","body":"content became parts"}]}}
+[1, 2, 3]
+"a bare JSON string line"
+null
