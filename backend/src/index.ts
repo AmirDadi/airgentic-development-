@@ -16,9 +16,14 @@
  *   TRANSCRIPT_SOURCES  JSON array of {agent, path, sessionId} transcripts to
  *                       tail. Default none — the board still shows agents and
  *                       features without it. Invalid JSON is ignored (logged).
- *   POLL_LIVENESS_MS    Liveness poll interval. Default 2000.
- *   POLL_PIPELINE_MS    Pipeline poll interval. Default 10000.
- *   POLL_TRANSCRIPT_MS  Transcript poll interval. Default 1000.
+ *   POLL_LIVENESS_MS    Liveness poll interval.
+ *   POLL_PIPELINE_MS    Pipeline poll interval.
+ *   POLL_TRANSCRIPT_MS  Transcript poll interval.
+ *                       All three default in runtime.ts (DEFAULT_INTERVALS).
+ *                       Deliberately NOT repeated here: when this file also
+ *                       named a default it passed it on every boot, so the
+ *                       runtime default was dead code and tuning it changed
+ *                       nothing in production.
  */
 
 import Database from "better-sqlite3";
@@ -29,10 +34,15 @@ import { createRuntime } from "./runtime.js";
 import type { TranscriptSource } from "./collectors/transcript.js";
 
 function envNumber(name: string, fallback: number): number {
+  return envNumberOpt(name) ?? fallback;
+}
+
+/** Undefined when unset or invalid, so the callee's own default applies. */
+function envNumberOpt(name: string): number | undefined {
   const raw = process.env[name];
-  if (raw === undefined || raw.trim() === "") return fallback;
+  if (raw === undefined || raw.trim() === "") return undefined;
   const value = Number(raw);
-  return Number.isFinite(value) && value > 0 ? value : fallback;
+  return Number.isFinite(value) && value > 0 ? value : undefined;
 }
 
 /** Parses TRANSCRIPT_SOURCES; bad config must not stop the server booting. */
@@ -79,10 +89,11 @@ const runtime = createRuntime(db, {
   session: process.env.TMUX_SESSION ?? "agents",
   specsDir: process.env.SPECS_DIR ?? "specs",
   sources,
+  // Left undefined when unset so runtime.ts owns the cadence in one place.
   intervalMs: {
-    liveness: envNumber("POLL_LIVENESS_MS", 2_000),
-    pipeline: envNumber("POLL_PIPELINE_MS", 10_000),
-    transcript: envNumber("POLL_TRANSCRIPT_MS", 1_000),
+    liveness: envNumberOpt("POLL_LIVENESS_MS"),
+    pipeline: envNumberOpt("POLL_PIPELINE_MS"),
+    transcript: envNumberOpt("POLL_TRANSCRIPT_MS"),
   },
 });
 

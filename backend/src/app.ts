@@ -6,6 +6,7 @@ import {
   listEvents,
   listFeatures,
   listMessages,
+  listEntries,
   insertEvent,
 } from "./db.js";
 import { groupIntoThreads } from "./threads.js";
@@ -57,6 +58,12 @@ const messagesQuerySchema = {
   additionalProperties: false,
 } as const;
 
+const entriesQuerySchema = {
+  type: "object",
+  properties: { limit: LIMIT },
+  additionalProperties: false,
+} as const;
+
 function num(v: string | undefined): number | undefined {
   return v === undefined ? undefined : Number(v);
 }
@@ -81,6 +88,14 @@ interface MessagesQuery {
   a?: string;
   b?: string;
   limit?: string;
+}
+
+interface EntriesQuery {
+  limit?: string;
+}
+
+interface AgentParams {
+  name: string;
 }
 
 interface IngestBody {
@@ -121,6 +136,26 @@ export function buildApp(
     { schema: { querystring: messagesQuerySchema } },
     async (req) =>
       listMessages(db, { a: req.query.a, b: req.query.b, limit: num(req.query.limit) }),
+  );
+
+  /**
+   * The agent detail view's feed: every kept transcript entry for one agent,
+   * oldest-first, `?limit=` keeping the newest N.
+   *
+   * `:name` is data, never a path: it is bound as a SQL parameter and used for
+   * an exact-equality lookup, so `..`, a slash or a `%` wildcard are just
+   * agent names that match nothing. An agent we hold no entries for is `200`
+   * with `[]` — having no transcript yet is normal, not an error, and a 404
+   * would make the UI show a failure for a perfectly healthy agent.
+   */
+  app.get<{ Params: AgentParams; Querystring: EntriesQuery }>(
+    "/agents/:name/entries",
+    { schema: { querystring: entriesQuerySchema } },
+    async (req) =>
+      listEntries(db, {
+        agent: req.params.name,
+        limit: num(req.query.limit),
+      }),
   );
 
   app.get("/threads", async () => groupIntoThreads(listMessages(db, {})));

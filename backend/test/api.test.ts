@@ -7,6 +7,8 @@ import {
   insertMessage,
   upsertAgent,
   upsertFeature,
+  insertEntries,
+  type StoredEntry,
 } from "../src/db.js";
 import type { Event, Message } from "../src/types.js";
 import { buildApp } from "../src/app.js";
@@ -595,5 +597,116 @@ describe("unknown routes", () => {
     const { app } = makeApp();
     const res = await app.inject({ method: "GET", url: "/nope" });
     expect(res.statusCode).toBe(404);
+  });
+});
+
+function entry(over: Partial<StoredEntry> & Pick<StoredEntry, "id" | "ts">): StoredEntry {
+  return {
+    agent: "lead",
+    kind: "assistant_text",
+    entry: { kind: "assistant_text", ts: over.ts, text: "hello" },
+    session_id: "s1",
+    ...over,
+  };
+}
+
+describe("GET /agents/:name/entries", () => {
+  it("returns that agent's entries oldest-first", async () => {
+    const { app, db } = makeApp();
+    insertEntries(db, [
+      entry({ id: "e2", ts: 20 }),
+      entry({ id: "e1", ts: 10 }),
+      entry({ id: "e3", ts: 30 }),
+      entry({ id: "x1", ts: 15, agent: "payments" }),
+    ]);
+
+    const res = await app.inject({ method: "GET", url: "/agents/lead/entries" });
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.map((e: StoredEntry) => e.id)).toEqual(["e1", "e2", "e3"]);
+    expect(body[0]).toEqual({
+      id: "e1",
+      agent: "lead",
+      ts: 10,
+      kind: "assistant_text",
+      entry: { kind: "assistant_text", ts: 10, text: "hello" },
+      session_id: "s1",
+    });
+  });
+
+  it("returns 200 and [] for an agent with no transcript yet", async () => {
+    const { app } = makeApp();
+    const res = await app.inject({ method: "GET", url: "/agents/nobody/entries" });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual([]);
+  });
+
+  it("keeps the NEWEST N when ?limit= is given, still oldest-first", async () => {
+    const { app, db } = makeApp();
+    insertEntries(db, [
+      entry({ id: "e1", ts: 10 }),
+      entry({ id: "e2", ts: 20 }),
+      entry({ id: "e3", ts: 30 }),
+    ]);
+
+    const res = await app.inject({ method: "GET", url: "/agents/lead/entries?limit=2" });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().map((e: StoredEntry) => e.id)).toEqual(["e2", "e3"]);
+  });
+
+  it("rejects a non-numeric ?limit= with 400", async () => {
+    const { app } = makeApp();
+    const res = await app.inject({ method: "GET", url: "/agents/lead/entries?limit=lots" });
+    expect(res.statusCode).toBe(400);
+  });
+
+  it("rejects a zero or negative ?limit= with 400", async () => {
+    const { app } = makeApp();
+    expect(
+      (await app.inject({ method: "GET", url: "/agents/lead/entries?limit=0" })).statusCode,
+    ).toBe(400);
+    expect(
+      (await app.inject({ method: "GET", url: "/agents/lead/entries?limit=-1" })).statusCode,
+    ).toBe(400);
+  });
+
+  it("ignores an unknown query parameter, as the other feeds do", async () => {
+    const { app, db } = makeApp();
+    insertEntries(db, [entry({ id: "e1", ts: 10 })]);
+    // ajv strips what the schema does not declare, so a stray `agent=` cannot
+    // be used to widen the query beyond the agent named in the path.
+    const res = await app.inject({
+      method: "GET",
+      url: "/agents/payments/entries?agent=lead",
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual([]);
+  });
+
+  it("treats a traversal-ish name as a plain (unknown) agent name", async () => {
+    const { app, db } = makeApp();
+    insertEntries(db, [entry({ id: "e1", ts: 10 })]);
+
+    for (const name of ["..", "%2e%2e", "%2e%2e%2f%2e%2e", "a%2Fb", "%00", "*", "lead%20"]) {
+      const res = await app.inject({
+        method: "GET",
+        url: `/agents/${name}/entries`,
+      });
+      // The name is a bound SQL parameter matched for exact equality, so the
+      // worst a traversal attempt can do is name an agent that does not exist:
+      // either the router never matches the route (404), or we answer with an
+      // empty list. Never a 5xx, and never another agent's entries.
+      expect([200, 404], name).toContain(res.statusCode);
+      if (res.statusCode === 200) expect(res.json(), name).toEqual([]);
+    }
+  });
+
+  it("matches the agent name exactly — no SQL wildcard behaviour", async () => {
+    const { app, db } = makeApp();
+    insertEntries(db, [entry({ id: "e1", ts: 10, agent: "lead" })]);
+
+    const res = await app.inject({ method: "GET", url: "/agents/lea%25/entries" });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual([]);
   });
 });

@@ -1,5 +1,12 @@
 import type Database from "better-sqlite3";
-import type { Agent, Event, Feature, Message, Stage } from "./types.js";
+import type {
+  Agent,
+  Event,
+  Feature,
+  Message,
+  Stage,
+  TranscriptEntry,
+} from "./types.js";
 
 /**
  * Creates the schema. Safe to run on every boot — every statement is
@@ -45,6 +52,19 @@ export function migrate(db: Database.Database): void {
       payload TEXT
     );
     CREATE INDEX IF NOT EXISTS events_ts ON events (ts);
+
+    CREATE TABLE IF NOT EXISTS entries (
+      id         TEXT PRIMARY KEY,
+      agent      TEXT NOT NULL,
+      ts         INTEGER NOT NULL,
+      kind       TEXT NOT NULL,
+      payload    TEXT NOT NULL,
+      session_id TEXT
+    );
+    -- Every read and every prune is "this agent, in time order"; without the
+    -- composite index both degrade to a full scan of a table that is, by
+    -- design, the biggest one here.
+    CREATE INDEX IF NOT EXISTS entries_agent_ts ON entries (agent, ts);
   `);
 }
 
@@ -175,6 +195,165 @@ export function listEvents(db: Database.Database, q: EventQuery): Event[] {
     // A payload that somehow isn't valid JSON must not break the feed.
     payload: r.payload === null ? null : safeParse(r.payload),
   }));
+}
+
+/**
+ * One transcript entry as it is kept for the agent detail view.
+ *
+ * `entry` is the parsed union member, stored serialised in `payload`. Every
+ * human-readable string on it is redacted BEFORE it gets here (PRD R4) — this
+ * layer stores what it is given and does not sanitise on the way out.
+ */
+export interface StoredEntry {
+  id: string;
+  agent: string;
+  ts: number;
+  kind: string;
+  entry: TranscriptEntry;
+  session_id: string | null;
+}
+
+interface EntryRow extends Omit<StoredEntry, "entry"> {
+  payload: string;
+}
+
+/**
+ * Inserts a batch of entries, ignoring ids we already hold.
+ *
+ * Idempotent by id, for the same reason messages are: a transcript re-read
+ * from offset 0 (a fresh process, a rotated file) replays entries we already
+ * stored, and a replay must be a no-op rather than a duplicate. One
+ * transaction per batch — a poll can bring in hundreds of rows.
+ */
+export function insertEntries(
+  db: Database.Database,
+  rows: StoredEntry[],
+): void {
+  if (!Array.isArray(rows) || rows.length === 0) return;
+  const stmt = db.prepare(
+    `INSERT INTO entries (id, agent, ts, kind, payload, session_id)
+     VALUES (@id, @agent, @ts, @kind, @payload, @session_id)
+     ON CONFLICT(id) DO NOTHING`,
+  );
+  const insertAll = db.transaction((batch: StoredEntry[]) => {
+    for (const row of batch) {
+      stmt.run({
+        id: row.id,
+        agent: row.agent,
+        ts: row.ts,
+        kind: row.kind,
+        payload: JSON.stringify(row.entry),
+        session_id: row.session_id,
+      });
+    }
+  });
+  insertAll(rows);
+}
+
+export interface EntryQuery {
+  agent?: string;
+  /** Keeps the newest N, still returned oldest-first (as listMessages does). */
+  limit?: number;
+}
+
+/**
+ * Entries in transcript order, oldest-first.
+ *
+ * The tiebreak is `rowid`, i.e. insertion order, NOT the id: most transcript
+ * entries within one line share a timestamp (and many carry none at all), and
+ * the order they were read in is then the only faithful reading order.
+ */
+export function listEntries(
+  db: Database.Database,
+  q: EntryQuery,
+): StoredEntry[] {
+  const where = q.agent === undefined ? "" : "WHERE agent = @agent";
+  const params = { agent: q.agent, limit: q.limit };
+
+  const rows =
+    q.limit === undefined
+      ? (db
+          .prepare(
+            `SELECT id, agent, ts, kind, payload, session_id FROM entries
+             ${where} ORDER BY ts ASC, rowid ASC`,
+          )
+          .all(params) as EntryRow[])
+      : // Newest N first, then flipped back to oldest-first for display.
+        (
+          db
+            .prepare(
+              `SELECT id, agent, ts, kind, payload, session_id FROM entries
+               ${where} ORDER BY ts DESC, rowid DESC LIMIT @limit`,
+            )
+            .all(params) as EntryRow[]
+        ).reverse();
+
+  return rows.map(({ payload, ...rest }) => ({
+    ...rest,
+    entry: parseEntry(payload, rest),
+  }));
+}
+
+/** A payload that somehow isn't valid JSON must not break the detail view. */
+function parseEntry(
+  payload: string,
+  row: Omit<EntryRow, "payload">,
+): TranscriptEntry {
+  try {
+    const parsed: unknown = JSON.parse(payload);
+    if (parsed !== null && typeof parsed === "object") {
+      return parsed as TranscriptEntry;
+    }
+  } catch {
+    /* fall through */
+  }
+  return { kind: "unknown", ts: row.ts, raw: payload };
+}
+
+/**
+ * A cheap per-agent "has anything changed" stamp, for the live broadcast.
+ *
+ * Row count plus the highest rowid: an insert moves the rowid, a prune moves
+ * the count, and nothing else touches the table (entries are immutable once
+ * written). Deliberately an aggregate query rather than reading the rows —
+ * the broadcaster runs on every poll and must not pull hundreds of payloads
+ * per agent per second just to discover that nothing happened.
+ */
+export function entryStamps(db: Database.Database): Map<string, string> {
+  const rows = db
+    .prepare(
+      `SELECT agent, COUNT(*) AS n, MAX(rowid) AS m FROM entries GROUP BY agent`,
+    )
+    .all() as { agent: string; n: number; m: number }[];
+  return new Map(rows.map((r) => [r.agent, `${r.n}:${r.m}`]));
+}
+
+/**
+ * Retention: keeps the most recent `keep` entries for one agent, deleting the
+ * rest. Entries are far higher volume than messages (~2000 for a single real
+ * session), so without this SQLite grows without bound. Scoped to one agent —
+ * a busy agent must never evict a quiet one's history.
+ */
+export function pruneEntries(
+  db: Database.Database,
+  agent: string,
+  keep: number,
+): void {
+  const limit = Number.isFinite(keep) && keep > 0 ? Math.floor(keep) : 0;
+  if (limit === 0) {
+    db.prepare(`DELETE FROM entries WHERE agent = @agent`).run({ agent });
+    return;
+  }
+  db.prepare(
+    `DELETE FROM entries
+     WHERE agent = @agent
+       AND rowid NOT IN (
+         SELECT rowid FROM entries
+         WHERE agent = @agent
+         ORDER BY ts DESC, rowid DESC
+         LIMIT @limit
+       )`,
+  ).run({ agent, limit });
 }
 
 function safeParse(s: string): unknown {

@@ -3,7 +3,13 @@ import Database from "better-sqlite3";
 import { mkdtemp, rm, writeFile, appendFile, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { migrate, listMessages, listAgents, upsertAgent } from "../../src/db";
+import {
+  migrate,
+  listMessages,
+  listAgents,
+  upsertAgent,
+  listEntries,
+} from "../../src/db";
 import {
   collectTranscripts,
   createTranscriptState,
@@ -485,5 +491,266 @@ describe("collectTranscripts", () => {
       ).resolves.toBeUndefined();
       expect(listMessages(db, {})).toHaveLength(0);
     });
+  });
+});
+
+/** A user-role text line — a prompt coming in. */
+function userLine(text: string, ts: string): string {
+  return JSON.stringify({
+    type: "user",
+    timestamp: ts,
+    message: { role: "user", content: [{ type: "text", text }] },
+  });
+}
+
+function thinkingLine(text: string, ts: string): string {
+  return JSON.stringify({
+    type: "assistant",
+    timestamp: ts,
+    message: { role: "assistant", content: [{ type: "thinking", thinking: text }] },
+  });
+}
+
+function toolCallLine(tool: string, command: string, ts: string): string {
+  return JSON.stringify({
+    type: "assistant",
+    timestamp: ts,
+    message: {
+      role: "assistant",
+      content: [{ type: "tool_use", id: "toolu_t", name: tool, input: { command } }],
+    },
+  });
+}
+
+function toolResultLine(content: string, ts: string): string {
+  return JSON.stringify({
+    type: "user",
+    timestamp: ts,
+    message: {
+      role: "user",
+      content: [{ type: "tool_result", tool_use_id: "toolu_t", content }],
+    },
+  });
+}
+
+function systemEventLine(mode: string, ts: string): string {
+  return JSON.stringify({ type: "mode", timestamp: ts, mode });
+}
+
+function turnEndLine(ts: string): string {
+  return JSON.stringify({ type: "result", timestamp: ts });
+}
+
+describe("collectTranscripts — entry persistence (P3 unit 2)", () => {
+  it("stores EVERY parsed entry, not just the send_messages", async () => {
+    const path = file("entries.jsonl");
+    await writeLines(path, [
+      userLine("please start", "2026-08-11T10:00:00.000Z"),
+      thinkingLine("weighing options", "2026-08-11T10:00:01.000Z"),
+      textLine("Starting now", "2026-08-11T10:00:02.000Z"),
+      toolCallLine("Bash", "npm test", "2026-08-11T10:00:03.000Z"),
+      toolResultLine("2 passing", "2026-08-11T10:00:04.000Z"),
+      sentLine("frontend-lead", "done", "2026-08-11T10:00:05.000Z"),
+      systemEventLine("plan", "2026-08-11T10:00:06.000Z"),
+      turnEndLine("2026-08-11T10:00:07.000Z"),
+      "definitely not json",
+    ]);
+
+    await collectTranscripts(db, [source(path)], createTranscriptState());
+
+    const rows = listEntries(db, { agent: "backend-dev" });
+    expect(rows.map((r) => r.kind)).toEqual([
+      "user_text",
+      "thinking",
+      "assistant_text",
+      "tool_call",
+      "tool_result",
+      "send_message",
+      "system_event",
+      "turn_end",
+      "unknown",
+    ]);
+    // The stored payload is the parsed entry itself.
+    expect(rows[3].entry).toMatchObject({ kind: "tool_call", tool: "Bash" });
+    for (const row of rows) {
+      expect(row.agent).toBe("backend-dev");
+      expect(row.session_id).toBe("sess-1");
+      expect(typeof row.ts).toBe("number");
+      expect(row.kind).toBe(row.entry.kind);
+    }
+    // Existing behaviour is untouched: the one SendMessage is still a message.
+    expect(listMessages(db, {})).toHaveLength(1);
+  });
+
+  it("stores entries for an agent the roster has never heard of", async () => {
+    const path = file("ghost-entries.jsonl");
+    await writeLines(path, [textLine("hello", "2026-08-11T10:00:00.000Z")]);
+
+    await collectTranscripts(db, [source(path, "not-in-db")], createTranscriptState());
+
+    expect(listEntries(db, { agent: "not-in-db" })).toHaveLength(1);
+    expect(listAgents(db)).toHaveLength(0);
+  });
+
+  it("REDACTS every human-readable string before storage (PRD R4)", async () => {
+    const path = file("secret-entries.jsonl");
+    await writeLines(path, [
+      userLine(`use ${SECRET}`, "2026-08-11T10:00:00.000Z"),
+      thinkingLine(`the key is ${SECRET}`, "2026-08-11T10:00:01.000Z"),
+      textLine(`writing ${SECRET} down`, "2026-08-11T10:00:02.000Z"),
+      toolCallLine("Bash", `export TOKEN=${SECRET}`, "2026-08-11T10:00:03.000Z"),
+      toolResultLine(`key ${SECRET}`, "2026-08-11T10:00:04.000Z"),
+      sentLine("frontend-lead", `creds ${SECRET}`, "2026-08-11T10:00:05.000Z"),
+      systemEventLine(SECRET, "2026-08-11T10:00:06.000Z"),
+      `garbage line carrying ${SECRET}`,
+    ]);
+
+    await collectTranscripts(db, [source(path)], createTranscriptState());
+
+    const rows = listEntries(db, { agent: "backend-dev" });
+    expect(rows.length).toBeGreaterThanOrEqual(8);
+
+    // THE critical assertion: the credential is nowhere in the stored entries.
+    expect(JSON.stringify(rows)).not.toContain(SECRET);
+    for (const row of rows) {
+      expect(JSON.stringify(row.entry)).not.toContain(SECRET);
+    }
+
+    // And it really was redacted, not merely dropped.
+    const byKind = (k: string) => rows.filter((r) => r.kind === k);
+    for (const kind of [
+      "user_text",
+      "thinking",
+      "assistant_text",
+      "tool_call",
+      "tool_result",
+      "send_message",
+      "system_event",
+      "unknown",
+    ]) {
+      expect(byKind(kind).length, kind).toBeGreaterThan(0);
+      expect(JSON.stringify(byKind(kind)), kind).toContain("[REDACTED:");
+    }
+
+    // Nothing in the whole database carries the raw secret either.
+    const dump = JSON.stringify({
+      entries: rows,
+      messages: listMessages(db, {}),
+    });
+    expect(dump).not.toContain(SECRET);
+  });
+
+  it("entry ids are stable — a replay from a fresh state adds nothing", async () => {
+    const path = file("stable-entries.jsonl");
+    await writeLines(path, [
+      textLine("one", "2026-08-11T10:00:00.000Z"),
+      toolCallLine("Bash", "ls", "2026-08-11T10:00:01.000Z"),
+      textLine("two", "2026-08-11T10:00:02.000Z"),
+    ]);
+
+    await collectTranscripts(db, [source(path)], createTranscriptState());
+    const first = listEntries(db, {});
+    expect(first).toHaveLength(3);
+
+    await collectTranscripts(db, [source(path)], createTranscriptState());
+    expect(listEntries(db, {})).toEqual(first);
+  });
+
+  it("entry ids are neither random nor clock-derived", async () => {
+    const path = file("stable-entries2.jsonl");
+    await writeLines(path, [textLine("only", "2026-08-11T10:00:00.000Z")]);
+
+    await collectTranscripts(db, [source(path)], createTranscriptState());
+    const idA = listEntries(db, {})[0].id;
+
+    const other = new Database(":memory:");
+    migrate(other);
+    await collectTranscripts(other, [source(path)], createTranscriptState());
+    const idB = listEntries(other, {})[0].id;
+    other.close();
+
+    expect(idB).toBe(idA);
+    expect(idA).not.toBe("");
+  });
+
+  it("appends only the new entries on an incremental poll", async () => {
+    const path = file("growing-entries.jsonl");
+    await writeLines(path, [textLine("first", "2026-08-11T10:00:00.000Z")]);
+
+    const state = createTranscriptState();
+    await collectTranscripts(db, [source(path)], state);
+    await appendLines(path, [textLine("second", "2026-08-11T10:01:00.000Z")]);
+    await collectTranscripts(db, [source(path)], state);
+
+    const rows = listEntries(db, { agent: "backend-dev" });
+    expect(rows).toHaveLength(2);
+    expect(rows.map((r) => (r.entry as { text: string }).text)).toEqual([
+      "first",
+      "second",
+    ]);
+  });
+
+  it("caps retention per agent with the keepEntries option", async () => {
+    const path = file("many-entries.jsonl");
+    const lines: string[] = [];
+    for (let i = 0; i < 12; i++) {
+      lines.push(textLine(`line-${i}`, `2026-08-11T10:00:${String(i).padStart(2, "0")}.000Z`));
+    }
+    await writeLines(path, lines);
+
+    await collectTranscripts(db, [source(path)], createTranscriptState(), {
+      keepEntries: 4,
+    });
+
+    const rows = listEntries(db, { agent: "backend-dev" });
+    expect(rows).toHaveLength(4);
+    expect(rows.map((r) => (r.entry as { text: string }).text)).toEqual([
+      "line-8",
+      "line-9",
+      "line-10",
+      "line-11",
+    ]);
+  });
+
+  it("caps retention at 500 per agent by default", async () => {
+    const path = file("huge-entries.jsonl");
+    const lines: string[] = [];
+    for (let i = 0; i < 620; i++) {
+      lines.push(textLine(`line-${i}`, `2026-08-11T10:00:00.000Z`));
+    }
+    await writeLines(path, lines);
+
+    await collectTranscripts(db, [source(path)], createTranscriptState());
+
+    const rows = listEntries(db, { agent: "backend-dev" });
+    expect(rows).toHaveLength(500);
+    expect((rows[rows.length - 1].entry as { text: string }).text).toBe("line-619");
+  });
+
+  it("prunes one agent's entries without touching another's", async () => {
+    const a = file("cap-a.jsonl");
+    const b = file("cap-b.jsonl");
+    await writeLines(a, [
+      textLine("a-1", "2026-08-11T10:00:00.000Z"),
+      textLine("a-2", "2026-08-11T10:00:01.000Z"),
+      textLine("a-3", "2026-08-11T10:00:02.000Z"),
+    ]);
+    await writeLines(b, [
+      textLine("b-1", "2026-08-11T10:00:00.000Z"),
+      textLine("b-2", "2026-08-11T10:00:01.000Z"),
+      textLine("b-3", "2026-08-11T10:00:02.000Z"),
+    ]);
+
+    await collectTranscripts(
+      db,
+      [source(a, "backend-dev", "sess-a"), source(b, "frontend-lead", "sess-b")],
+      createTranscriptState(),
+      { keepEntries: 1 },
+    );
+
+    expect(listEntries(db, { agent: "backend-dev" }).map((r) => (r.entry as { text: string }).text))
+      .toEqual(["a-3"]);
+    expect(listEntries(db, { agent: "frontend-lead" }).map((r) => (r.entry as { text: string }).text))
+      .toEqual(["b-3"]);
   });
 });

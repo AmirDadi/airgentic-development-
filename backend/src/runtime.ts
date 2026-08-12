@@ -18,7 +18,13 @@
 
 import { execFile } from "node:child_process";
 import type Database from "better-sqlite3";
-import { listAgents, listFeatures, listMessages } from "./db.js";
+import {
+  entryStamps,
+  listAgents,
+  listEntries,
+  listFeatures,
+  listMessages,
+} from "./db.js";
 import { groupIntoThreads } from "./threads.js";
 import type { SseHub } from "./sse.js";
 import { collectLiveness, type CommandRunner } from "./collectors/liveness.js";
@@ -159,6 +165,17 @@ export const defaultListPrs: () => Promise<Record<string, PrInfo>> = (() => {
 const CHANNEL_AGENTS = "agents";
 const CHANNEL_FEATURES = "features";
 const CHANNEL_MESSAGES = "messages";
+const CHANNEL_ENTRIES = "entries";
+
+/**
+ * How many of an agent's newest entries ride on one `entries` broadcast.
+ *
+ * Bounded well below the retention cap on purpose: the payload goes out on
+ * every change, to every connected client, and shipping a 500-entry blob at
+ * the poll rate would flood the stream. A client that wants the full history
+ * asks `GET /agents/:name/entries` once and then follows the channel.
+ */
+const ENTRIES_BROADCAST_LIMIT = 200;
 
 export function createRuntime(
   db: Database.Database,
@@ -199,11 +216,21 @@ export function createRuntime(
    * timestamps; anything a user can actually see change (stage, branch, pr_url,
    * alive, current_activity, membership) still fires.
    */
-  function broadcast(channel: string, data: unknown, signature: unknown): void {
+  function broadcast(
+    channel: string,
+    data: unknown,
+    signature: unknown,
+    /**
+     * Dedupe key, when several payloads share one channel name. The `entries`
+     * channel carries one agent per message, so each agent needs its own
+     * "last sent" slot or a busy agent would suppress a quiet one's update.
+     */
+    key: string = channel,
+  ): void {
     try {
       const serialised = JSON.stringify(signature);
-      if (lastSent.get(channel) === serialised) return;
-      lastSent.set(channel, serialised);
+      if (lastSent.get(key) === serialised) return;
+      lastSent.set(key, serialised);
       opts.hub.broadcast(channel, data);
     } catch {
       // A hub with a broken sink, or data that won't serialise, is not worth
@@ -240,6 +267,23 @@ export function createRuntime(
       // signature — no clock churn to strip.
       const threads = groupIntoThreads(listMessages(db, {}));
       broadcast(CHANNEL_MESSAGES, threads, threads);
+    } catch {
+      /* ditto */
+    }
+    try {
+      // Per-agent, not one global blob: entries are the highest-volume thing
+      // the dashboard holds, and only the agent that actually moved needs to
+      // be re-sent. The stamp is an aggregate, so an unchanged agent costs no
+      // row reads at all — which is what makes a 400ms poll affordable.
+      for (const [agent, stamp] of entryStamps(db)) {
+        const key = `${CHANNEL_ENTRIES}:${agent}`;
+        if (lastSent.get(key) === JSON.stringify(stamp)) continue;
+        const entries = listEntries(db, {
+          agent,
+          limit: ENTRIES_BROADCAST_LIMIT,
+        });
+        broadcast(CHANNEL_ENTRIES, { agent, entries }, stamp, key);
+      }
     } catch {
       /* ditto */
     }
