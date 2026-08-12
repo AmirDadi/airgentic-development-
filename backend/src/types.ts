@@ -59,11 +59,28 @@ export interface Event {
  * error: the JSONL schema is internal and may change under us (PRD R1).
  */
 export type TranscriptEntry =
+  /** A `text` block on an assistant message — what the agent said. */
   | { kind: "assistant_text"; ts: number | null; text: string }
+  /** A `text` block (or bare string content) on a user message — a prompt in. */
+  | { kind: "user_text"; ts: number | null; text: string }
+  /** A `thinking` block — the model's own reasoning, bounded to one line. */
+  | { kind: "thinking"; ts: number | null; text: string }
   | {
       kind: "tool_call";
       ts: number | null;
       tool: string;
+      summary: string;
+      /** The block's `id`, so a later tool_result can be paired back to it. */
+      id: string | null;
+    }
+  | {
+      kind: "tool_result";
+      ts: number | null;
+      /** Matches the `id` of the tool_call it answers; null when absent. */
+      tool_use_id: string | null;
+      /** False when the block carried `is_error: true`. */
+      ok: boolean;
+      /** Bounded, single-line rendering of the result payload. */
       summary: string;
     }
   | {
@@ -73,5 +90,11 @@ export type TranscriptEntry =
       peer: string;
       body: string;
     }
+  /**
+   * A non-message bookkeeping entry (`attachment`, `last-prompt`,
+   * `queue-operation`, `system`, `mode`). Recognised so it does not pollute the
+   * unknown rate, but deliberately NOT treated as agent activity.
+   */
+  | { kind: "system_event"; ts: number | null; event: string; detail: string }
   | { kind: "turn_end"; ts: number | null }
   | { kind: "unknown"; ts: number | null; raw: string };

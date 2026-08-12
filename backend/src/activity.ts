@@ -30,8 +30,10 @@ const TOOL_VERBS: Record<string, string> = {
   grep: "searching",
   glob: "searching",
   task: "delegating to",
+  agent: "delegating to",
   websearch: "searching the web with",
   webfetch: "fetching with",
+  toolsearch: "searching for tools with",
 };
 
 function oneLine(value: string): string {
@@ -57,11 +59,66 @@ function describeToolCall(tool: string | null, summary: string | null): string |
   return summary === null ? head : `${head}: ${summary}`;
 }
 
+/**
+ * Name of the tool a result belongs to, found by walking back to the
+ * `tool_call` that carried the same id. A tool_result block does not repeat the
+ * tool name, so "Bash finished" is only sayable with this pairing; when the
+ * call has already scrolled out of the window we fall back to "the tool".
+ */
+function toolForResult(
+  entries: TranscriptEntry[],
+  index: number,
+  toolUseId: string | null,
+): string | null {
+  if (toolUseId === null || toolUseId === "") return null;
+  for (let i = index - 1; i >= 0; i--) {
+    const candidate = entries[i];
+    if (candidate === null || typeof candidate !== "object") continue;
+    if (candidate.kind === "tool_call" && candidate.id === toolUseId) {
+      return nonEmpty(candidate.tool);
+    }
+  }
+  return null;
+}
+
+function describeToolResult(
+  entry: Extract<TranscriptEntry, { kind: "tool_result" }>,
+  entries: TranscriptEntry[],
+  index: number,
+): string | null {
+  const summary = nonEmpty(entry.summary);
+  const tool = toolForResult(entries, index, entry.tool_use_id);
+  if (entry.ok) {
+    // A bare success with nothing to show says less than the call before it.
+    if (summary === null && tool === null) return null;
+    const head = tool === null ? "tool finished" : `${tool} finished`;
+    return summary === null ? head : `${head}: ${summary}`;
+  }
+  const head = tool === null ? "tool call failed" : `${tool} failed`;
+  return summary === null ? head : `${head}: ${summary}`;
+}
+
 /** One-line description of a single entry, or null when it says nothing. */
-function describe(entry: TranscriptEntry): string | null {
+function describe(entry: TranscriptEntry, entries: TranscriptEntry[], index: number): string | null {
   switch (entry.kind) {
     case "assistant_text":
       return nonEmpty(entry.text);
+    case "user_text": {
+      const body = nonEmpty(entry.text);
+      return body === null ? null : `handling request: ${body}`;
+    }
+    case "thinking": {
+      const body = nonEmpty(entry.text);
+      return body === null ? null : `thinking: ${body}`;
+    }
+    case "tool_result":
+      return describeToolResult(entry, entries, index);
+    case "system_event":
+      // Attachments, queue operations, mode switches and hook summaries are
+      // session bookkeeping, not something the agent is DOING. Recognised by
+      // the parser so they do not count as unknown, but stepped over here so
+      // the roster keeps showing the last real action.
+      return null;
     case "tool_call":
       return describeToolCall(nonEmpty(entry.tool), nonEmpty(entry.summary));
     case "send_message": {
@@ -92,7 +149,7 @@ export function deriveActivity(entries: TranscriptEntry[]): string {
     for (let i = entries.length - 1; i >= 0; i--) {
       const entry = entries[i];
       if (entry === null || typeof entry !== "object") continue;
-      const described = describe(entry);
+      const described = describe(entry, entries, i);
       if (described !== null) return clamp(described);
     }
     return UNKNOWN_ACTIVITY;
