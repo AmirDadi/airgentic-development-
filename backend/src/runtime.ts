@@ -63,7 +63,11 @@ export interface Runtime {
 const DEFAULT_INTERVALS = {
   liveness: 2_000,
   pipeline: 10_000,
-  transcript: 1_000,
+  // Measured: an idle poll pass costs ~0.18ms per source, so 400ms is ~0.07%
+  // of a core at 10 agents. Halving mean latency to ~200ms costs one line of
+  // config, where inotify would cost a second code path (see
+  // docs/IMPLEMENTATION-P3.md).
+  transcript: 400,
 } as const;
 
 /** Max stdout we accept from an injected command; a runaway must not eat RAM. */
