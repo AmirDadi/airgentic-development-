@@ -1,10 +1,11 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createApi, type ApiClient } from "./api";
 import { useLive, type EventSourceFactory } from "./useLive";
 import { TeamBoard } from "./components/TeamBoard";
 import { PipelineBoard } from "./components/PipelineBoard";
 import { Conversations } from "./components/Conversations";
-import type { Agent, Feature, Thread } from "./types";
+import { AgentDetail } from "./components/AgentDetail";
+import type { Agent, Feature, StoredEntry, Thread } from "./types";
 
 const TABS = [
   { id: "team", label: "Team" },
@@ -31,7 +32,14 @@ export default function App({ api, liveFactory, now }: AppProps = {}) {
   const [features, setFeatures] = useState<Feature[]>([]);
   const [threads, setThreads] = useState<Thread[]>([]);
   const [selectedThreadId, setSelectedThreadId] = useState<string>();
+  const [selectedAgent, setSelectedAgent] = useState<string>();
+  const [entries, setEntries] = useState<StoredEntry[]>([]);
   const [error, setError] = useState<string>();
+
+  // Read by the SSE handler, which must not be re-created (and re-subscribed)
+  // every time the open agent changes.
+  const selectedAgentRef = useRef(selectedAgent);
+  selectedAgentRef.current = selectedAgent;
 
   // Initial snapshot over REST. The SSE channel only carries deltas, so
   // without this the board would stay empty until something changed.
@@ -60,15 +68,47 @@ export default function App({ api, liveFactory, now }: AppProps = {}) {
     };
   }, [client]);
 
+  // Snapshot of the open agent's transcript. Live `entries` frames then keep
+  // it current without a refetch.
+  useEffect(() => {
+    if (selectedAgent === undefined) {
+      setEntries([]);
+      return;
+    }
+
+    let cancelled = false;
+    (async () => {
+      try {
+        const e = await client.agentEntries(selectedAgent);
+        if (!cancelled) setEntries(e);
+      } catch {
+        if (!cancelled) setEntries([]);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [client, selectedAgent]);
+
   const onEvent = useCallback((type: string, data: unknown) => {
     if (type === "agents") setAgents(data as Agent[]);
     else if (type === "features") setFeatures(data as Feature[]);
     else if (type === "messages") setThreads(data as Thread[]);
+    else if (type === "entries") {
+      const frame = data as { agent?: string; entries?: StoredEntry[] };
+      // Only the open agent's stream is applied; other agents' frames are noise
+      // for this view.
+      if (frame.agent === selectedAgentRef.current && Array.isArray(frame.entries)) {
+        setEntries(frame.entries);
+      }
+    }
   }, []);
 
   const { connected } = useLive({ onEvent, factory: liveFactory });
 
   const selected = selectedThreadId ?? threads[0]?.id;
+  const openAgent = agents.find((a) => a.name === selectedAgent);
 
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900">
@@ -110,7 +150,20 @@ export default function App({ api, liveFactory, now }: AppProps = {}) {
       )}
 
       <main className="p-4">
-        {tab === "team" && <TeamBoard agents={agents} now={now ?? Date.now()} />}
+        {tab === "team" &&
+          (openAgent ? (
+            <AgentDetail
+              agent={openAgent}
+              entries={entries}
+              onBack={() => setSelectedAgent(undefined)}
+            />
+          ) : (
+            <TeamBoard
+              agents={agents}
+              now={now ?? Date.now()}
+              onSelectAgent={setSelectedAgent}
+            />
+          ))}
         {tab === "pipeline" && <PipelineBoard features={features} />}
         {tab === "conversations" && (
           <Conversations

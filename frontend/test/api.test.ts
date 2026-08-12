@@ -43,6 +43,59 @@ describe("createApi", () => {
     );
   });
 
+  it("requests an agent's entries from its own endpoint", async () => {
+    const f = fakeFetch([]);
+    const api = createApi({ baseUrl: "http://dash", fetch: f });
+
+    await api.agentEntries("payments");
+    expect(f).toHaveBeenLastCalledWith(
+      "http://dash/agents/payments/entries",
+      expect.anything(),
+    );
+  });
+
+  it("passes `limit` as a query param only when provided", async () => {
+    const f = fakeFetch([]);
+    const api = createApi({ baseUrl: "http://dash", fetch: f });
+
+    await api.agentEntries("payments", 50);
+    expect(f).toHaveBeenLastCalledWith(
+      "http://dash/agents/payments/entries?limit=50",
+      expect.anything(),
+    );
+  });
+
+  it("encodes an agent name that would otherwise break the path", async () => {
+    const f = fakeFetch([]);
+    const api = createApi({ baseUrl: "http://dash", fetch: f });
+
+    await api.agentEntries("team/lead");
+    expect(f).toHaveBeenLastCalledWith(
+      "http://dash/agents/team%2Flead/entries",
+      expect.anything(),
+    );
+  });
+
+  it("returns the parsed entries body", async () => {
+    const entry = {
+      id: "e1",
+      agent: "payments",
+      ts: 5,
+      kind: "assistant_text",
+      entry: { kind: "assistant_text", ts: 5, text: "hi" },
+      session_id: "s1",
+    };
+    const api = createApi({ fetch: fakeFetch([entry]) });
+    await expect(api.agentEntries("payments")).resolves.toEqual([entry]);
+  });
+
+  it("surfaces an entries failure as ApiError carrying the status", async () => {
+    const f = fakeFetch({ error: "no such agent" }, { ok: false, status: 404 });
+    await expect(
+      createApi({ fetch: f }).agentEntries("ghost"),
+    ).rejects.toMatchObject({ status: 404 });
+  });
+
   it("defaults to a relative base so it works when served by the backend", async () => {
     const f = fakeFetch([]);
     await createApi({ fetch: f }).agents();

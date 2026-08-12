@@ -1,4 +1,4 @@
-import type { Agent, Feature } from "./types";
+import type { Agent, Feature, StoredEntry } from "./types";
 
 /**
  * Every failure the client can produce — HTTP, network, or malformed body —
@@ -52,6 +52,8 @@ export interface ApiClient {
   features(): Promise<Feature[]>;
   threads(): Promise<unknown[]>;
   events(since?: number): Promise<unknown[]>;
+  /** Oldest-first transcript entries for one agent. */
+  agentEntries(name: string, limit?: number): Promise<StoredEntry[]>;
 }
 
 export function createApi(opts: ApiOptions = {}): ApiClient {
@@ -67,6 +69,14 @@ export function createApi(opts: ApiOptions = {}): ApiClient {
     events: (since?: number) =>
       get<unknown[]>(
         since === undefined ? "/events" : `/events?since=${since}`,
+        cfg,
+      ),
+    // The name is a path segment, so it is encoded — a name containing "/"
+    // would otherwise silently address a different route.
+    agentEntries: (name: string, limit?: number) =>
+      get<StoredEntry[]>(
+        `/agents/${encodeURIComponent(name)}/entries` +
+          (limit === undefined ? "" : `?limit=${limit}`),
         cfg,
       ),
   };
