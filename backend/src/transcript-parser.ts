@@ -19,6 +19,35 @@ const ELLIPSIS = "…";
 /** Tool names that mean "I sent a message to another agent". */
 const SEND_MESSAGE_TOOLS = new Set(["sendmessage", "send_message", "sendmessagetoagent"]);
 
+/**
+ * Tool names that mean "I spawned a subagent and handed it work".
+ *
+ * On real transcripts there is no SendMessage tool at all — delegation shows up
+ * as an `Agent` (or `Task`) tool_use in the parent, with the child's own
+ * transcript written to `<session>/subagents/agent-<id>.jsonl`. From the
+ * dashboard's point of view that IS an outbound message: one agent gave another
+ * agent an instruction, and the conversations view should show it as such.
+ */
+const SPAWN_AGENT_TOOLS = new Set(["agent", "task"]);
+
+/** Where a spawn tool_use records who it spawned, most specific first. */
+const SPAWN_PEER_KEYS = ["subagent_type", "subagentType", "agent_type", "agent", "name"];
+/** Where a spawn tool_use records the instruction. `prompt` is a last resort — it is long. */
+const SPAWN_BODY_KEYS = ["description", "prompt"];
+
+/**
+ * Root `type` values that carry no message but are perfectly well understood:
+ * session bookkeeping. Mapped to `system_event` with the listed key as detail,
+ * so they are not mistaken for a schema we failed to parse.
+ */
+const SYSTEM_EVENT_TYPES = new Map<string, string | null>([
+  ["attachment", null], // detail comes from attachment.type
+  ["last-prompt", null], // no detail: it is a pointer, and the prompt is the user_text
+  ["queue-operation", "operation"],
+  ["system", "subtype"],
+  ["mode", "mode"],
+]);
+
 /** Input keys, most-informative first, used to summarise a tool call. */
 const SUMMARY_KEYS = [
   "command",
@@ -43,6 +72,15 @@ const FROM_KEYS = ["from", "from_agent", "fromAgent", "sender", "peer", "agent"]
 /** Root-level markers for "the agent finished its turn". */
 const TURN_END_TYPES = new Set(["result", "turn_end", "turn_complete", "turn-end"]);
 const TURN_END_SUBTYPES = new Set(["turn_end", "turn_complete", "turn-end", "end_turn"]);
+
+/**
+ * `message.stop_reason` values that mean the agent handed control back.
+ *
+ * This is the signal that actually appears in real transcripts: there is no
+ * root-level `result` entry, only assistant messages whose stop_reason is
+ * `end_turn` (as opposed to `tool_use`, or null mid-stream).
+ */
+const STOP_REASON_TURN_END = new Set(["end_turn", "stop_sequence"]);
 
 const MESSAGE_PREFIX_RE =
   /^\s*\[?\s*(?:new\s+)?(?:message|msg)\s+from\s+([^\]\s:,]+)\s*\]?\s*[:\-]?\s*([\s\S]*)$/i;
@@ -130,6 +168,33 @@ function summariseToolInput(input: unknown): string {
   return truncate(oneLine(raw ?? ""), SUMMARY_MAX_LENGTH);
 }
 
+/** One-line, length-bounded rendering of any free text we surface. */
+function condense(value: string | null): string {
+  return truncate(oneLine(value ?? ""), SUMMARY_MAX_LENGTH);
+}
+
+/**
+ * An `Agent`/`Task` tool_use — the real delegation pattern. The peer is the
+ * subagent that was spawned; the body is its one-line brief, never the full
+ * prompt, which can run to thousands of characters.
+ */
+function spawnMessage(
+  input: unknown,
+  ts: number | null,
+): Extract<TranscriptEntry, { kind: "send_message" }> | null {
+  if (!isRecord(input)) return null;
+  const peer = firstString(input, SPAWN_PEER_KEYS);
+  const body = firstString(input, SPAWN_BODY_KEYS);
+  if (peer === null && body === null) return null;
+  return {
+    kind: "send_message",
+    ts,
+    direction: "sent",
+    peer: peer ?? "",
+    body: condense(body),
+  };
+}
+
 /** A `tool_use` block whose name is SendMessage — an outbound agent message. */
 function outboundMessage(
   input: unknown,
@@ -192,24 +257,82 @@ function classifyBlock(
 
   if (blockType === "text") {
     const body = text(block["text"]);
-    if (body !== null && isAssistant) return { kind: "assistant_text", ts, text: body };
-    return unknownEntry(raw, ts);
+    if (body === null) return unknownEntry(raw, ts);
+    // A user-role text block is a prompt coming IN, not the agent talking.
+    return isAssistant
+      ? { kind: "assistant_text", ts, text: body }
+      : { kind: "user_text", ts, text: body };
+  }
+
+  if (blockType === "thinking") {
+    // An EMPTY thinking string is common and meaningful ("it is reasoning"),
+    // so presence of the field — not its length — is what we require here.
+    const body = block["thinking"] ?? block["text"];
+    if (typeof body !== "string") return unknownEntry(raw, ts);
+    return { kind: "thinking", ts, text: condense(text(body)) };
   }
 
   if (blockType === "tool_use") {
     const tool = text(block["name"]);
     if (tool === null) return unknownEntry(raw, ts);
-    if (SEND_MESSAGE_TOOLS.has(tool.toLowerCase())) {
+    const lowered = tool.toLowerCase();
+    if (SEND_MESSAGE_TOOLS.has(lowered)) {
       return outboundMessage(block["input"], ts) ?? unknownEntry(raw, ts);
     }
-    return { kind: "tool_call", ts, tool, summary: summariseToolInput(block["input"]) };
+    if (SPAWN_AGENT_TOOLS.has(lowered)) {
+      // A spawn with no brief at all is still a tool call, so fall through.
+      const spawned = spawnMessage(block["input"], ts);
+      if (spawned !== null) return spawned;
+    }
+    return {
+      kind: "tool_call",
+      ts,
+      tool,
+      summary: summariseToolInput(block["input"]),
+      id: text(block["id"]),
+    };
   }
 
   if (blockType === "tool_result") {
-    return inboundMessage(block, ts) ?? unknownEntry(raw, ts);
+    // A peer's reply arrives as a tool_result too; that reading wins when it
+    // matches, because "an agent messaged me" is more informative than "a tool
+    // returned". Everything else is an ordinary result — NOT unknown.
+    const inbound = inboundMessage(block, ts);
+    if (inbound !== null) return inbound;
+    return {
+      kind: "tool_result",
+      ts,
+      tool_use_id: text(block["tool_use_id"]),
+      ok: block["is_error"] !== true,
+      summary: condense(flattenContent(block["content"])),
+    };
   }
 
   return unknownEntry(raw, ts);
+}
+
+/**
+ * A bookkeeping root entry (`attachment`, `mode`, …) rendered as a
+ * `system_event`. Returns null for anything not in the known set, so an
+ * unfamiliar future root type still degrades to `unknown` (PRD R1).
+ */
+function systemEvent(
+  root: Record<string, unknown>,
+  rootType: string,
+  ts: number | null,
+): TranscriptEntry | null {
+  if (!SYSTEM_EVENT_TYPES.has(rootType)) return null;
+  const detailKey = SYSTEM_EVENT_TYPES.get(rootType) ?? null;
+
+  let detail: string | null = null;
+  if (rootType === "attachment") {
+    const attachment = root["attachment"];
+    detail = isRecord(attachment) ? text(attachment["type"]) : null;
+  } else if (detailKey !== null) {
+    detail = text(root[detailKey]);
+  }
+
+  return { kind: "system_event", ts, event: rootType, detail: condense(detail) };
 }
 
 function isTurnEnd(root: Record<string, unknown>): boolean {
@@ -242,23 +365,40 @@ export function parseEntries(line: string): TranscriptEntry[] {
     const ts = timestampOf(root);
     if (isTurnEnd(root)) return [{ kind: "turn_end", ts }];
 
+    const rootType = text(root["type"])?.toLowerCase() ?? "";
     const message = root["message"];
     if (isRecord(message)) {
       const role = text(message["role"])?.toLowerCase() ?? "";
-      const rootType = text(root["type"])?.toLowerCase() ?? "";
       const isAssistant = role === "assistant" || rootType === "assistant";
       const content = message["content"];
 
+      // The turn boundary rides on the SAME entry as the final content block,
+      // so it is appended rather than substituted: the dashboard needs both
+      // "here is what it said" and "and then it went idle".
+      const stopReason = text(message["stop_reason"])?.toLowerCase() ?? "";
+      const endsTurn = STOP_REASON_TURN_END.has(stopReason);
+
+      const out: TranscriptEntry[] = [];
       if (typeof content === "string") {
         const body = text(content);
-        if (body !== null && isAssistant) return [{ kind: "assistant_text", ts, text: body }];
-        return [unknownEntry(raw, ts)];
+        if (body !== null) {
+          out.push(
+            isAssistant
+              ? { kind: "assistant_text", ts, text: body }
+              : { kind: "user_text", ts, text: body },
+          );
+        }
+      } else if (Array.isArray(content)) {
+        for (const block of content) out.push(classifyBlock(block, ts, isAssistant, raw));
       }
 
-      if (Array.isArray(content) && content.length > 0) {
-        return content.map((block) => classifyBlock(block, ts, isAssistant, raw));
-      }
+      if (endsTurn) out.push({ kind: "turn_end", ts });
+      if (out.length > 0) return out;
+      return [unknownEntry(raw, ts)];
     }
+
+    const bookkeeping = systemEvent(root, rootType, ts);
+    if (bookkeeping !== null) return [bookkeeping];
 
     return [unknownEntry(raw, ts)];
   } catch {
