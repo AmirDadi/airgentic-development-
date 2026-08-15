@@ -62,6 +62,22 @@ describe("createStreamRedactor", () => {
     expect(full).toContain("[REDACTED:private-key-block]");
   });
 
+  it("holds back the SECOND of two back-to-back PEM blocks", () => {
+    // Regression: the guard tracked the FIRST BEGIN marker, so once it closed,
+    // a second block's body streamed raw before its own END arrived.
+    const two =
+      "-----BEGIN EC PRIVATE KEY-----\nAAAAbodyone1111\n-----END EC PRIVATE KEY-----\n" +
+      "-----BEGIN RSA PRIVATE KEY-----\nBBBBbodytwo2222\n-----END RSA PRIVATE KEY-----";
+    const r = createStreamRedactor();
+    let streamed = "";
+    for (const ch of two) streamed += r.push(ch);
+    expect(streamed).not.toContain("BBBBbodytwo2222");
+    expect(streamed).not.toContain("AAAAbodyone1111");
+    const full = streamed + r.flush();
+    expect(full).toBe(redact(two));
+    expect(full.match(/\[REDACTED:private-key-block\]/g)).toHaveLength(2);
+  });
+
   it("emits committed prose incrementally rather than only at the end", () => {
     const r = createStreamRedactor();
     // A completed line should be available before the turn ends.

@@ -57,22 +57,29 @@ export function createStreamRedactor(): {
     // marker ("-----BEGIN RSA PRIVATE KEY-----") contains spaces, so the
     // whitespace boundary alone would commit the start of a key before it is
     // recognizable — and redaction, needing both markers, would then let the
-    // body through. Hold the whole block until its END marker is complete.
-    const begin = raw.indexOf(BEGIN);
-    if (begin !== -1) {
-      const closed = endMarker.test(raw.slice(begin));
-      if (!closed || begin < boundary) {
-        // Not yet closed, or closed but the block starts before the boundary:
-        // in both cases only commit past it once the full block is redactable.
-        const end = endMarker.exec(raw.slice(begin));
-        const blockEnd = end ? begin + end.index + end[0].length : raw.length;
-        if (begin < boundary && blockEnd > boundary) boundary = begin;
-        if (!closed) boundary = Math.min(boundary, begin);
+    // body through. Guard the LAST begin marker: any earlier block is already
+    // closed and behind it, so redaction handles it when committed; only the
+    // most recent block can still be open or reach past the boundary.
+    let holdFrom = -1;
+
+    // A trailing run that is only a *prefix* of "-----BEGIN" (still forming).
+    const dangling = danglingBeginPrefix();
+    if (dangling > 0) holdFrom = raw.length - dangling;
+
+    const lastBegin = raw.lastIndexOf(BEGIN);
+    if (lastBegin !== -1) {
+      const end = endMarker.exec(raw.slice(lastBegin));
+      const blockEnd = end
+        ? lastBegin + end.index + end[0].length
+        : Number.POSITIVE_INFINITY; // not closed yet
+      // Hold from this block's start when it is not closed, or when its END
+      // marker has not itself been committed past the boundary.
+      if (blockEnd > boundary) {
+        holdFrom = holdFrom === -1 ? lastBegin : Math.min(holdFrom, lastBegin);
       }
-    } else {
-      // No full BEGIN yet, but a trailing run could be one forming — hold it.
-      boundary = Math.min(boundary, raw.length - danglingBeginPrefix());
     }
+
+    if (holdFrom !== -1) boundary = Math.min(boundary, holdFrom);
     return boundary;
   }
 
