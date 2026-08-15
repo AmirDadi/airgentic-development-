@@ -105,13 +105,42 @@ separate.
   bridge owns that session's lifecycle: if it dies, its address disappears and
   the dashboard must restart it and re-advertise.
 
-## Cost and caveats
+## Auth: subscription, not an API key
 
-The full spike cost **~$0.56** across three probes. The first two were
-expensive (~$0.24 each) because a session attaching to an existing project
-loads its context; the clean, well-scoped third probe cost **$0.09**.
+The probes ran with **no `ANTHROPIC_API_KEY` set**. This environment
+authenticates via OAuth against a Claude subscription
+(`CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR`), and headless `claude -p` worked
+fine that way.
 
-Measured on **one machine, one Claude Code version**, with subscription auth.
-Not verified: behaviour under `--bare` (documented to skip socket binding),
-long-lived multi-turn headless sessions held open for hours, or two humans
-driving one lead concurrently (PRD R3).
+That is direct evidence against a claim worth correcting: preliminary desk
+research asserted that SDK/headless sessions *require* an API key. For plain
+headless `claude -p` they do not. (`--bare` is documented to differ and was
+NOT tested — see caveats.)
+
+## Usage, not billing
+
+The `total_cost_usd` field reported by `--output-format json` is a **list-price
+valuation of token usage**, printed regardless of how the session is
+authenticated. Under subscription auth it does not produce an incremental
+charge; it consumes plan usage and rate limits. It becomes literal spend only
+if a deployment authenticates with an API key instead.
+
+Recorded for relative scale, since P4 will run a session continuously:
+
+| probe | reported usage value | note |
+|---|---|---|
+| socket + `ListAgents` | ~$0.24 | attached to an existing project, so it loaded that context |
+| first (confounded) run | ~$0.23 | same reason |
+| clean, scoped `SendMessage` | **$0.09** | the representative figure |
+
+The lesson for P4 is about **context size**, not price: a bridge session that
+reloads a large project context on every turn is roughly 2.5× the usage of a
+tightly scoped one.
+
+## Caveats
+
+Measured on **one machine, one Claude Code version**, subscription auth. Not
+verified: behaviour under `--bare` (documented to skip socket binding, and
+documented to require an explicit API key), long-lived multi-turn headless
+sessions held open for hours, or two humans driving one lead concurrently
+(PRD R3).
