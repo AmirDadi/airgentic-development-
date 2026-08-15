@@ -16,6 +16,12 @@
  *   TRANSCRIPT_SOURCES  JSON array of {agent, path, sessionId} transcripts to
  *                       tail. Default none — the board still shows agents and
  *                       features without it. Invalid JSON is ignored (logged).
+ *   UI_DIR              Directory of the built frontend to serve from this
+ *                       same origin. Defaults to ../frontend/dist when that
+ *                       exists, so `npm run build` in both workspaces gives a
+ *                       single URL that serves the dashboard AND its API.
+ *                       The UI fetches same-origin relative paths, so without
+ *                       this there is no URL that serves a working dashboard.
  *   POLL_LIVENESS_MS    Liveness poll interval.
  *   POLL_PIPELINE_MS    Pipeline poll interval.
  *   POLL_TRANSCRIPT_MS  Transcript poll interval.
@@ -26,6 +32,8 @@
  *                       nothing in production.
  */
 
+import { existsSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import Database from "better-sqlite3";
 import { buildApp } from "./app.js";
 import { migrate } from "./db.js";
@@ -75,7 +83,17 @@ migrate(db);
 // One hub, shared by the HTTP fan-out and the collector runtime.
 const hub = createSseHub();
 
-const app = buildApp(db, { hub, logger: true });
+const defaultUiDir = fileURLToPath(new URL("../../frontend/dist", import.meta.url));
+const uiDir =
+  process.env.UI_DIR ?? (existsSync(defaultUiDir) ? defaultUiDir : undefined);
+
+const app = buildApp(db, { hub, logger: true, uiDir });
+if (uiDir === undefined) {
+  app.log.warn(
+    "No built frontend found; serving the API only. Run `npm run build` in " +
+      "frontend/, or set UI_DIR, to serve the dashboard itself.",
+  );
+}
 
 const { sources, error: sourcesError } = parseSources(
   process.env.TRANSCRIPT_SOURCES,

@@ -1,4 +1,7 @@
 import { describe, it, expect, vi } from "vitest";
+import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import Database from "better-sqlite3";
 import type { FastifyInstance } from "fastify";
 import {
@@ -708,5 +711,66 @@ describe("GET /agents/:name/entries", () => {
     const res = await app.inject({ method: "GET", url: "/agents/lea%25/entries" });
     expect(res.statusCode).toBe(200);
     expect(res.json()).toEqual([]);
+  });
+});
+
+describe("serving the dashboard UI", () => {
+  // The design doc specifies the UI is "served by the same Fastify". It never
+  // was, so there was no URL that served the dashboard at all: in dev the
+  // browser's relative fetch("/agents") hit Vite's SPA fallback and got
+  // index.html with a 200, which fails JSON parsing and renders the
+  // "backend unreachable" banner forever.
+  it("serves index.html at / when a UI directory is configured", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "ui-"));
+    writeFileSync(join(dir, "index.html"), "<!doctype html><title>Dash</title>");
+
+    const db = makeDb();
+    const app = buildApp(db, { uiDir: dir });
+    const res = await app.inject({ method: "GET", url: "/" });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.headers["content-type"]).toContain("text/html");
+    expect(res.body).toContain("Dash");
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("falls back to index.html for a client-side route, not 404", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "ui-"));
+    writeFileSync(join(dir, "index.html"), "<!doctype html><title>Dash</title>");
+
+    const db = makeDb();
+    const app = buildApp(db, { uiDir: dir });
+    const res = await app.inject({ method: "GET", url: "/some/deep/route" });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toContain("Dash");
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("never lets the SPA fallback shadow an API route", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "ui-"));
+    writeFileSync(join(dir, "index.html"), "<!doctype html><title>Dash</title>");
+
+    const db = makeDb();
+    const app = buildApp(db, { uiDir: dir });
+
+    // This is the exact failure the UI hit against Vite: HTML where JSON was
+    // expected. The API must still win.
+    const res = await app.inject({ method: "GET", url: "/agents" });
+    expect(res.statusCode).toBe(200);
+    expect(res.headers["content-type"]).toContain("application/json");
+    expect(res.json()).toEqual([]);
+
+    // An unknown API-shaped path must 404 as JSON, not silently return HTML.
+    const missing = await app.inject({ method: "GET", url: "/agents/x/nope" });
+    expect(missing.body).not.toContain("Dash");
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("still runs with no UI directory configured (API-only mode)", async () => {
+    const db = makeDb();
+    const app = buildApp(db);
+    expect((await app.inject({ method: "GET", url: "/health" })).statusCode).toBe(200);
+    expect((await app.inject({ method: "GET", url: "/" })).statusCode).toBe(404);
   });
 });

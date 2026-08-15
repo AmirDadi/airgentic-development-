@@ -100,7 +100,20 @@ export default function App({ api, liveFactory, now }: AppProps = {}) {
       // Only the open agent's stream is applied; other agents' frames are noise
       // for this view.
       if (frame.agent === selectedAgentRef.current && Array.isArray(frame.entries)) {
-        setEntries(frame.entries);
+        const incoming = frame.entries;
+        setEntries((prev) => {
+          // MERGE, never replace. The server caps each frame at its newest N
+          // entries while the initial REST snapshot returns everything it
+          // retains, so replacing would make history the user is currently
+          // reading disappear the moment the agent says anything.
+          //
+          // The frame is the newest contiguous run, so anything of ours not in
+          // it is strictly older: keep those in place and append the frame,
+          // preserving the server's ordering within it.
+          const incomingIds = new Set(incoming.map((e) => e.id));
+          const older = prev.filter((e) => !incomingIds.has(e.id));
+          return [...older, ...incoming];
+        });
       }
     }
   }, []);
