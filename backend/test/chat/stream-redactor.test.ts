@@ -78,6 +78,31 @@ describe("createStreamRedactor", () => {
     expect(full.match(/\[REDACTED:private-key-block\]/g)).toHaveLength(2);
   });
 
+  it("does not leak a key body between a decoy BEGIN and a later real END", () => {
+    // The hard case: an earlier `-----BEGIN` with no key of its own. redact()'s
+    // non-greedy pairing collapses everything from that decoy to the NEXT END,
+    // so the real key body in between must be held until that END arrives —
+    // tracking only the most recent BEGIN missed the decoy and streamed it raw.
+    const body =
+      "MIIEvQIBADANBgkqhkiFAKEBODY0000111122223333444455556666777788889999";
+    const text =
+      "-----BEGIN RSA PRIVATE KEY----- decoy, no key here\n" +
+      body +
+      "\nunrelated chatter that keeps going so a naive streamer commits it\n" +
+      "-----BEGIN RSA PRIVATE KEY-----\nAAAAsecond1111\n" +
+      "-----END RSA PRIVATE KEY-----\nthe end\n";
+
+    for (const size of [1, 3, 17]) {
+      const r = createStreamRedactor();
+      let streamed = "";
+      for (let i = 0; i < text.length; i += size) {
+        streamed += r.push(text.slice(i, i + size));
+      }
+      expect(streamed, `size ${size}`).not.toContain(body);
+      expect(streamed + r.flush(), `size ${size}`).toBe(redact(text));
+    }
+  });
+
   it("emits committed prose incrementally rather than only at the end", () => {
     const r = createStreamRedactor();
     // A completed line should be available before the turn ends.

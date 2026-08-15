@@ -27,15 +27,55 @@ export function createStreamRedactor(): {
   let raw = ""; // everything seen so far
   let emittedLen = 0; // length of redacted output already returned
 
-  const BEGIN = "-----BEGIN";
-  const endMarker = /-----END [^\n]*KEY-----/;
+  const BEGIN_LITERAL = "-----BEGIN";
+  // Mirror redact.ts EXACTLY so the streamer pairs markers the same way redact
+  // does: any looseness here could commit text redact would later collapse.
+  const beginMarker = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/g;
+  const endMarker = /-----END [A-Z0-9 ]*PRIVATE KEY-----/g;
 
   /** Longest suffix of `raw` that is a prefix of the PEM BEGIN marker. */
   function danglingBeginPrefix(): number {
-    for (let k = Math.min(raw.length, BEGIN.length); k > 0; k--) {
-      if (raw.slice(raw.length - k) === BEGIN.slice(0, k)) return k;
+    for (let k = Math.min(raw.length, BEGIN_LITERAL.length); k > 0; k--) {
+      if (raw.slice(raw.length - k) === BEGIN_LITERAL.slice(0, k)) return k;
     }
     return 0;
+  }
+
+  /**
+   * Start index of the first `-----BEGIN` that is NOT part of a PEM block fully
+   * closed at or before `limit`, or -1 if none.
+   *
+   * Two subtleties, each of which leaked a key in an earlier version:
+   *  - The literal `-----BEGIN` is matched, not the full marker regex, so a
+   *    still-forming marker line (`-----BEGIN RSA PRIVATE`) is held rather than
+   *    committed word by word before it is recognizable.
+   *  - Blocks pair as redact()'s non-greedy global regex pairs them — each
+   *    BEGIN with the NEXT END, resuming after it — so a decoy `-----BEGIN`
+   *    with no key still swallows a later END, and the real key body between
+   *    them is held until that END arrives.
+   * Over-holding (a stray `-----BEGIN` in prose that never forms a key) only
+   * delays streaming until flush; it never leaks. Under-holding leaks.
+   */
+  function unclosedBlockStart(limit: number): number {
+    let i = 0;
+    while (i < limit) {
+      const p = raw.indexOf(BEGIN_LITERAL, i);
+      if (p === -1 || p >= limit) return -1;
+
+      beginMarker.lastIndex = p;
+      const b = beginMarker.exec(raw);
+      if (b !== null && b.index === p) {
+        endMarker.lastIndex = p + b[0].length;
+        const e = endMarker.exec(raw);
+        if (e !== null && e.index + e[0].length <= limit) {
+          i = e.index + e[0].length; // block closed within limit; scan onward
+          continue;
+        }
+      }
+      // Marker still forming, or its END not yet committed: hold from here.
+      return p;
+    }
+    return -1;
   }
 
   /** Index up to which no in-progress secret can exist. */
@@ -53,33 +93,17 @@ export function createStreamRedactor(): {
     );
     let boundary = lastWs === -1 ? 0 : lastWs + 1;
 
-    // The one secret with internal whitespace is a PEM private key: its very
-    // marker ("-----BEGIN RSA PRIVATE KEY-----") contains spaces, so the
-    // whitespace boundary alone would commit the start of a key before it is
-    // recognizable — and redaction, needing both markers, would then let the
-    // body through. Guard the LAST begin marker: any earlier block is already
-    // closed and behind it, so redaction handles it when committed; only the
-    // most recent block can still be open or reach past the boundary.
-    let holdFrom = -1;
+    // Hold from the first PEM block that isn't fully closed before the
+    // boundary: a private key spans newlines and its markers carry spaces, so
+    // the whitespace boundary alone would commit key material redact can only
+    // collapse once BOTH markers are present.
+    const open = unclosedBlockStart(boundary);
+    if (open !== -1) boundary = Math.min(boundary, open);
 
     // A trailing run that is only a *prefix* of "-----BEGIN" (still forming).
     const dangling = danglingBeginPrefix();
-    if (dangling > 0) holdFrom = raw.length - dangling;
+    if (dangling > 0) boundary = Math.min(boundary, raw.length - dangling);
 
-    const lastBegin = raw.lastIndexOf(BEGIN);
-    if (lastBegin !== -1) {
-      const end = endMarker.exec(raw.slice(lastBegin));
-      const blockEnd = end
-        ? lastBegin + end.index + end[0].length
-        : Number.POSITIVE_INFINITY; // not closed yet
-      // Hold from this block's start when it is not closed, or when its END
-      // marker has not itself been committed past the boundary.
-      if (blockEnd > boundary) {
-        holdFrom = holdFrom === -1 ? lastBegin : Math.min(holdFrom, lastBegin);
-      }
-    }
-
-    if (holdFrom !== -1) boundary = Math.min(boundary, holdFrom);
     return boundary;
   }
 
@@ -87,8 +111,11 @@ export function createStreamRedactor(): {
     push(chunk: string): string {
       raw += chunk;
       const committed = redact(raw.slice(0, committedBoundary()));
-      // committed is a stable prefix of the eventual full redaction, so we
-      // only ever append the part we have not sent yet.
+      // committed is a stable prefix of the eventual full redaction. If it ever
+      // shrank (it must not, given the hold-back above) we emit nothing rather
+      // than a rewound slice — a raw byte already sent can never be unsent, so
+      // never bet on being able to repair one.
+      if (committed.length <= emittedLen) return "";
       const next = committed.slice(emittedLen);
       emittedLen = committed.length;
       return next;
