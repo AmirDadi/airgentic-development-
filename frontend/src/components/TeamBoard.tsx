@@ -1,4 +1,5 @@
 import type { Agent } from "../types";
+import { StopButton } from "./StopButton";
 
 const DEFAULT_STALLED_AFTER_MS = 10 * 60 * 1000;
 
@@ -42,12 +43,21 @@ export function TeamBoard(props: {
   stalledAfterMs?: number;
   /** Optional: when given, each agent name becomes a button that opens its detail view. */
   onSelectAgent?: (name: string) => void;
+  /** Optional: when given, each card gets a confirm-guarded Stop control. */
+  onStopAgent?: (name: string) => void;
+  /** Names of agents whose Stop is currently in flight. */
+  stoppingAgents?: ReadonlySet<string>;
+  /** A standing reason Stop is unavailable for all agents (e.g. a 503 seen once). */
+  stopDisabledReason?: string;
 }): JSX.Element {
   const {
     agents,
     now,
     stalledAfterMs = DEFAULT_STALLED_AFTER_MS,
     onSelectAgent,
+    onStopAgent,
+    stoppingAgents,
+    stopDisabledReason,
   } = props;
 
   return (
@@ -99,7 +109,20 @@ export function TeamBoard(props: {
                 <p className="mt-2 break-words text-sm text-slate-600">
                   {agent.current_activity ?? "activity unknown"}
                 </p>
-                <p className="mt-1 text-xs text-slate-400">{agent.kind}</p>
+                <div className="mt-1 flex items-end justify-between gap-2">
+                  <p className="text-xs text-slate-400">{agent.kind}</p>
+                  {onStopAgent && (
+                    <div className="text-right">
+                      <StopButton
+                        agent={agent.name}
+                        alive={agent.alive}
+                        onStop={onStopAgent}
+                        busy={stoppingAgents?.has(agent.name) ?? false}
+                        disabledReason={stopDisabledReason}
+                      />
+                    </div>
+                  )}
+                </div>
               </li>
             );
           })}

@@ -20,11 +20,29 @@ export interface TmuxWindow {
 }
 
 /**
- * The output shape is OURS, not tmux's human-readable default: an explicit
- * tab-delimited format keeps parsing stable across tmux versions.
+ * Field separator for our custom format.
+ *
+ * Must be PRINTABLE. tmux (3.4, confirmed on a real box) sanitizes its `-F`
+ * output: it rewrites tab and whitespace to `_`, and escapes other control
+ * characters to a literal octal form (0x1f comes out as the four characters
+ * `\037`). So neither a tab nor a control-char delimiter survives — the fields
+ * collapse and liveness silently reports zero agents. A distinctive printable
+ * sentinel round-trips unchanged; `|:|` is vanishingly unlikely inside an agent
+ * window name (identifiers) or a pane command (a process name), and an odd line
+ * that did contain it is skipped by the tolerant parser rather than crashing.
  */
-export const TMUX_WINDOW_FORMAT =
-  "#{window_index}\t#{window_name}\t#{window_active}\t#{pane_current_command}";
+export const FIELD_SEP = "|:|";
+
+/**
+ * The output shape is OURS, not tmux's human-readable default: an explicit
+ * delimiter keeps parsing stable across tmux versions.
+ */
+export const TMUX_WINDOW_FORMAT = [
+  "#{window_index}",
+  "#{window_name}",
+  "#{window_active}",
+  "#{pane_current_command}",
+].join(FIELD_SEP);
 
 /**
  * Builds the read-only tmux command we shell out to.
@@ -52,7 +70,7 @@ export function parseTmuxWindows(stdout: string): TmuxWindow[] {
     const line = rawLine.replace(/\r$/, "");
     if (line.trim() === "") continue;
 
-    const fields = line.split("\t");
+    const fields = line.split(FIELD_SEP);
     // A usable record needs at least an index and a name.
     if (fields.length < 2) continue;
 

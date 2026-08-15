@@ -161,6 +161,66 @@ describe("createApi", () => {
     });
   });
 
+  it("posts a stop to the agent's own endpoint with an empty body when no actor is given", async () => {
+    const f = fakeFetch({ id: "ev1", type: "agent_stopped", agent: "payments", ts: 9 });
+    const api = createApi({ baseUrl: "http://dash", fetch: f });
+
+    await api.stopAgent("payments");
+    expect(f).toHaveBeenLastCalledWith(
+      "http://dash/agents/payments/stop",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({}),
+      }),
+    );
+  });
+
+  it("includes the actor in the stop body only when provided", async () => {
+    const f = fakeFetch({ id: "ev1", type: "agent_stopped", agent: "payments", ts: 9 });
+    const api = createApi({ baseUrl: "http://dash", fetch: f });
+
+    await api.stopAgent("payments", "Amirreza");
+    expect(f).toHaveBeenLastCalledWith(
+      "http://dash/agents/payments/stop",
+      expect.objectContaining({
+        body: JSON.stringify({ actor: "Amirreza" }),
+      }),
+    );
+  });
+
+  it("encodes an agent name that would otherwise break the stop path", async () => {
+    const f = fakeFetch({ id: "ev1", type: "agent_stopped", agent: "team/lead", ts: 9 });
+    const api = createApi({ baseUrl: "http://dash", fetch: f });
+
+    await api.stopAgent("team/lead");
+    expect(f).toHaveBeenLastCalledWith(
+      "http://dash/agents/team%2Flead/stop",
+      expect.anything(),
+    );
+  });
+
+  it("returns the created audit event on a successful stop", async () => {
+    const event = { id: "ev1", type: "agent_stopped", agent: "payments", ts: 9 };
+    const api = createApi({ fetch: fakeFetch(event) });
+    await expect(api.stopAgent("payments")).resolves.toEqual(event);
+  });
+
+  it("surfaces an unknown agent as ApiError carrying 404", async () => {
+    const f = fakeFetch({ error: "no such agent" }, { ok: false, status: 404 });
+    await expect(
+      createApi({ fetch: f }).stopAgent("ghost"),
+    ).rejects.toMatchObject({ status: 404 });
+  });
+
+  it("surfaces an unconfigured Stop as ApiError carrying 503", async () => {
+    const f = fakeFetch({ error: "stop not configured" }, { ok: false, status: 503 });
+    const rejected = createApi({ fetch: f }).stopAgent("payments");
+    await expect(rejected).rejects.toBeInstanceOf(ApiError);
+    await expect(
+      createApi({ fetch: f }).stopAgent("payments"),
+    ).rejects.toMatchObject({ status: 503 });
+  });
+
   it("requests chat history from its own endpoint and returns it", async () => {
     const message = {
       id: "m1",

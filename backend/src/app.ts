@@ -16,6 +16,8 @@ import { createSseHub, type SseHub } from "./sse.js";
 import { redact } from "./redact.js";
 import type { Bridge } from "./chat/bridge.js";
 import { createTurnQueue } from "./chat/queue.js";
+import { stopAgent } from "./stop.js";
+import type { CommandRunner } from "./collectors/liveness.js";
 import fastifyStatic from "@fastify/static";
 
 /**
@@ -55,6 +57,20 @@ export interface BuildAppOptions {
    * runs normally.
    */
   chat?: Bridge;
+  /**
+   * The Stop control capability. INJECTED, always: tests drive a fake runner
+   * and no real tmux is ever touched by the app. Omitted = Stop is not
+   * configured, and `POST /agents/:name/stop` answers 503 while the rest of the
+   * dashboard runs normally (exactly like `POST /chat` without a bridge).
+   *
+   * `index.ts` supplies the real `defaultRunner` and `TMUX_SESSION` here.
+   */
+  stop?: {
+    /** tmux session the agents live in. */
+    session: string;
+    /** Executor for the interrupt command; `shell:false` under the hood. */
+    runner: CommandRunner;
+  };
 }
 
 /** Who the lead answers as, in stored chat messages. */
@@ -155,6 +171,20 @@ interface ChatBody {
   user?: string;
 }
 
+const stopBodySchema = {
+  type: "object",
+  properties: {
+    // Optional; when present it must be a non-empty string (who requested the
+    // Stop, for the audit trail). Absent = defaulted to "web" in the handler.
+    actor: { type: "string", minLength: 1 },
+  },
+  additionalProperties: false,
+} as const;
+
+interface StopBody {
+  actor?: string;
+}
+
 /**
  * Builds the HTTP app around an already-migrated DB handle. Deliberately does
  * not listen: tests drive it with `app.inject()`, `index.ts` owns the socket.
@@ -210,6 +240,59 @@ export function buildApp(
   );
 
   app.get("/threads", async () => groupIntoThreads(listMessages(db, {})));
+
+  /**
+   * Stop (interrupt) one agent's current turn. The first write into an agent's
+   * runtime, so it is guarded (PRD R5): interrupt-only, audited, injection-safe.
+   *
+   * `:name` is DATA — a path param handed straight to `stopAgent`, which looks
+   * it up by exact equality against the `agents` table and, if it matches,
+   * passes it to the pure argv builder as a single element. It is never
+   * interpolated into a shell. A traversal-ish or wildcard name simply matches
+   * no known agent and 404s.
+   *
+   * Status map: unknown agent → 404; tmux/exec failure → 502; success → 200
+   * with the created audit event. When Stop is not configured → 503, like
+   * `POST /chat` without a bridge — the rest of the dashboard runs regardless.
+   */
+  app.post<{ Params: AgentParams; Body: StopBody }>(
+    "/agents/:name/stop",
+    { schema: { body: stopBodySchema } },
+    async (req, reply) => {
+      const stop = opts.stop;
+      if (stop === undefined) {
+        return reply
+          .code(503)
+          .send({ error: "stop control not configured" });
+      }
+
+      const result = await stopAgent(db, req.params.name, {
+        actor: req.body?.actor,
+        session: stop.session,
+        runner: stop.runner,
+      });
+
+      // Any real invocation wrote an audit row (success OR failure); the
+      // unknown-agent path wrote nothing and has no event. Broadcast whatever
+      // was written on the channel the timeline follows, so it shows up live.
+      if (result.event !== undefined) hub.broadcast("events", result.event);
+
+      if (result.ok) {
+        return reply.code(200).send(result.event);
+      }
+
+      if (result.reason === "unknown") {
+        // A Stop that targeted nobody: never ran, never audited.
+        return reply.code(404).send({ error: result.error ?? "unknown agent" });
+      }
+
+      // The interrupt failed (tmux down / window gone). The attempt is already
+      // audited as a failure inside stopAgent; report an upstream error.
+      return reply
+        .code(502)
+        .send({ error: result.error ?? "stop command failed" });
+    },
+  );
 
   app.post<{ Body: IngestBody }>(
     "/ingest",

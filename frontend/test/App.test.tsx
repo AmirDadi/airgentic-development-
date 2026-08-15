@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import App from "../src/App";
 import type { ApiClient } from "../src/api";
@@ -63,6 +63,12 @@ function fakeApi(over: Partial<ApiClient> = {}): ApiClient {
     agentEntries: vi.fn(async () => [storedEntry()]),
     sendChat: vi.fn(async () => ({ turnId: "turn-1" })),
     chatHistory: vi.fn(async () => []),
+    stopAgent: vi.fn(async () => ({
+      id: "ev1",
+      type: "agent_stopped",
+      agent: "payments",
+      ts: 1,
+    })),
     ...over,
   };
 }
@@ -263,6 +269,79 @@ describe("App", () => {
       expect(screen.getByText("first chunk of output")).toBeInTheDocument(),
     );
     expect(screen.queryByText("someone else's output")).not.toBeInTheDocument();
+  });
+});
+
+describe("App stop control", () => {
+  it("stops an agent from the team board only after a confirmation naming it", async () => {
+    const api = fakeApi();
+    renderApp(api);
+    await screen.findByText("payments");
+
+    // A single click opens the confirmation; it must NOT call the endpoint yet.
+    await userEvent.click(screen.getByRole("button", { name: /stop payments/i }));
+    expect(api.stopAgent).not.toHaveBeenCalled();
+
+    const dialog = screen.getByRole("dialog");
+    expect(dialog).toHaveAccessibleName(/payments/i);
+
+    await userEvent.click(within(dialog).getByRole("button", { name: /confirm/i }));
+    await waitFor(() => expect(api.stopAgent).toHaveBeenCalledWith("payments"));
+  });
+
+  it("does not call the endpoint when the confirmation is cancelled", async () => {
+    const api = fakeApi();
+    renderApp(api);
+    await screen.findByText("payments");
+
+    await userEvent.click(screen.getByRole("button", { name: /stop payments/i }));
+    await userEvent.click(
+      within(screen.getByRole("dialog")).getByRole("button", { name: /cancel/i }),
+    );
+
+    expect(api.stopAgent).not.toHaveBeenCalled();
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  it("disables further stops with a standing reason when the server answers 503", async () => {
+    const api = fakeApi({
+      stopAgent: vi.fn(async () => {
+        throw new ApiError("stop not configured", 503);
+      }),
+    });
+    renderApp(api);
+    await screen.findByText("payments");
+
+    await userEvent.click(screen.getByRole("button", { name: /stop payments/i }));
+    await userEvent.click(
+      within(screen.getByRole("dialog")).getByRole("button", { name: /confirm/i }),
+    );
+
+    // The reason is surfaced and the control is disabled, but the app is intact.
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: /stop payments/i })).toBeDisabled(),
+    );
+    expect(screen.getByText(/not configured/i)).toBeInTheDocument();
+    expect(screen.getByText("running tests")).toBeInTheDocument();
+  });
+
+  it("keeps the dashboard usable when a stop fails for another reason", async () => {
+    const api = fakeApi({
+      stopAgent: vi.fn(async () => {
+        throw new ApiError("boom", 500);
+      }),
+    });
+    renderApp(api);
+    await screen.findByText("payments");
+
+    await userEvent.click(screen.getByRole("button", { name: /stop payments/i }));
+    await userEvent.click(
+      within(screen.getByRole("dialog")).getByRole("button", { name: /confirm/i }),
+    );
+
+    await waitFor(() => expect(api.stopAgent).toHaveBeenCalled());
+    // The board still shows the agent — no blank page.
+    expect(screen.getByText("running tests")).toBeInTheDocument();
   });
 });
 

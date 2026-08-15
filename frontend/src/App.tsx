@@ -79,6 +79,12 @@ export default function App({ api, liveFactory, now }: AppProps = {}) {
   const [turns, setTurns] = useState<ChatTurn[]>([]);
   const [chatDisabled, setChatDisabled] = useState<string>();
 
+  // Agents with a Stop in flight, and a standing reason Stop is unavailable
+  // (set once the server answers 503 — it is a deployment condition, not a
+  // per-click failure, so it disables every Stop rather than blanking the app).
+  const [stopping, setStopping] = useState<ReadonlySet<string>>(new Set());
+  const [stopDisabled, setStopDisabled] = useState<string>();
+
   // Ids for turns the backend never accepted, so they cannot collide with
   // server-issued turn ids or with each other.
   const localTurnId = useRef(0);
@@ -270,6 +276,36 @@ export default function App({ api, liveFactory, now }: AppProps = {}) {
     [client],
   );
 
+  // The dashboard never stops an agent on its own — this fires only from a
+  // user-confirmed StopButton (PRD R5). On success nothing else is needed: the
+  // live `agents`/`events` feed reflects the interrupt. A 503 means Stop is not
+  // configured on the server, a standing condition, so it disables every Stop
+  // with a reason rather than throwing. Any other failure is surfaced, not
+  // swallowed and not allowed to blank the page.
+  const onStopAgent = useCallback(
+    (name: string) => {
+      setStopping((prev) => new Set(prev).add(name));
+      void (async () => {
+        try {
+          await client.stopAgent(name);
+        } catch (e) {
+          if (e instanceof ApiError && e.status === 503) {
+            setStopDisabled("Stop is not configured on this server.");
+          } else {
+            setError("Could not stop the agent — please try again.");
+          }
+        } finally {
+          setStopping((prev) => {
+            const next = new Set(prev);
+            next.delete(name);
+            return next;
+          });
+        }
+      })();
+    },
+    [client],
+  );
+
   const selected = selectedThreadId ?? threads[0]?.id;
   const openAgent = agents.find((a) => a.name === selectedAgent);
 
@@ -319,12 +355,18 @@ export default function App({ api, liveFactory, now }: AppProps = {}) {
               agent={openAgent}
               entries={entries}
               onBack={() => setSelectedAgent(undefined)}
+              onStopAgent={onStopAgent}
+              stopping={stopping.has(openAgent.name)}
+              stopDisabledReason={stopDisabled}
             />
           ) : (
             <TeamBoard
               agents={agents}
               now={now ?? Date.now()}
               onSelectAgent={setSelectedAgent}
+              onStopAgent={onStopAgent}
+              stoppingAgents={stopping}
+              stopDisabledReason={stopDisabled}
             />
           ))}
         {tab === "pipeline" && <PipelineBoard features={features} />}

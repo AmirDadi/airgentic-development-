@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import Database from "better-sqlite3";
 import { migrate, listAgents, upsertAgent } from "../../src/db";
-import { buildListWindowsCommand, TMUX_WINDOW_FORMAT } from "../../src/tmux";
+import { buildListWindowsCommand, TMUX_WINDOW_FORMAT, FIELD_SEP } from "../../src/tmux";
 import {
   collectLiveness,
   type CommandRunner,
@@ -17,7 +17,7 @@ function line(
   active = false,
   command = "node",
 ): string {
-  return `${index}\t${name}\t${active ? 1 : 0}\t${command}`;
+  return [index, name, active ? 1 : 0, command].join(FIELD_SEP);
 }
 
 /** A runner that always succeeds with the given stdout, recording its argv. */
@@ -525,7 +525,7 @@ describe("collectLiveness", () => {
       // Format still emits the tab-separated fields; the command field is empty.
       await collectLiveness(db, {
         session: SESSION,
-        runner: okRunner("0\tpayments\t1\t"),
+        runner: okRunner(["0","payments","1",""].join(FIELD_SEP)),
         now: () => 6_000,
       });
 
