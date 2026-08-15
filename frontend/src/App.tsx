@@ -1,10 +1,11 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createApi, type ApiClient } from "./api";
 import { useLive, type EventSourceFactory } from "./useLive";
 import { TeamBoard } from "./components/TeamBoard";
 import { PipelineBoard } from "./components/PipelineBoard";
 import { Conversations } from "./components/Conversations";
-import type { Agent, Feature, Thread } from "./types";
+import { AgentDetail } from "./components/AgentDetail";
+import type { Agent, Feature, StoredEntry, Thread } from "./types";
 
 const TABS = [
   { id: "team", label: "Team" },
@@ -31,7 +32,14 @@ export default function App({ api, liveFactory, now }: AppProps = {}) {
   const [features, setFeatures] = useState<Feature[]>([]);
   const [threads, setThreads] = useState<Thread[]>([]);
   const [selectedThreadId, setSelectedThreadId] = useState<string>();
+  const [selectedAgent, setSelectedAgent] = useState<string>();
+  const [entries, setEntries] = useState<StoredEntry[]>([]);
   const [error, setError] = useState<string>();
+
+  // Read by the SSE handler, which must not be re-created (and re-subscribed)
+  // every time the open agent changes.
+  const selectedAgentRef = useRef(selectedAgent);
+  selectedAgentRef.current = selectedAgent;
 
   // Initial snapshot over REST. The SSE channel only carries deltas, so
   // without this the board would stay empty until something changed.
@@ -60,15 +68,70 @@ export default function App({ api, liveFactory, now }: AppProps = {}) {
     };
   }, [client]);
 
+  // Snapshot of the open agent's transcript. Live `entries` frames then keep
+  // it current without a refetch.
+  useEffect(() => {
+    if (selectedAgent === undefined) {
+      setEntries([]);
+      return;
+    }
+
+    let cancelled = false;
+    (async () => {
+      try {
+        const snapshot = await client.agentEntries(selectedAgent);
+        if (cancelled) return;
+        // MERGE for the same reason live frames do. This request was issued
+        // before it resolved, so a frame may have landed meanwhile and the
+        // snapshot is already stale — replacing would make output the user
+        // just watched arrive disappear again. The snapshot is the older,
+        // authoritative history; anything live we hold beyond it is newer.
+        setEntries((prev) => {
+          const snapshotIds = new Set(snapshot.map((e) => e.id));
+          const newer = prev.filter((e) => !snapshotIds.has(e.id));
+          return [...snapshot, ...newer];
+        });
+      } catch {
+        if (!cancelled) setEntries([]);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [client, selectedAgent]);
+
   const onEvent = useCallback((type: string, data: unknown) => {
     if (type === "agents") setAgents(data as Agent[]);
     else if (type === "features") setFeatures(data as Feature[]);
     else if (type === "messages") setThreads(data as Thread[]);
+    else if (type === "entries") {
+      const frame = data as { agent?: string; entries?: StoredEntry[] };
+      // Only the open agent's stream is applied; other agents' frames are noise
+      // for this view.
+      if (frame.agent === selectedAgentRef.current && Array.isArray(frame.entries)) {
+        const incoming = frame.entries;
+        setEntries((prev) => {
+          // MERGE, never replace. The server caps each frame at its newest N
+          // entries while the initial REST snapshot returns everything it
+          // retains, so replacing would make history the user is currently
+          // reading disappear the moment the agent says anything.
+          //
+          // The frame is the newest contiguous run, so anything of ours not in
+          // it is strictly older: keep those in place and append the frame,
+          // preserving the server's ordering within it.
+          const incomingIds = new Set(incoming.map((e) => e.id));
+          const older = prev.filter((e) => !incomingIds.has(e.id));
+          return [...older, ...incoming];
+        });
+      }
+    }
   }, []);
 
   const { connected } = useLive({ onEvent, factory: liveFactory });
 
   const selected = selectedThreadId ?? threads[0]?.id;
+  const openAgent = agents.find((a) => a.name === selectedAgent);
 
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900">
@@ -110,7 +173,20 @@ export default function App({ api, liveFactory, now }: AppProps = {}) {
       )}
 
       <main className="p-4">
-        {tab === "team" && <TeamBoard agents={agents} now={now ?? Date.now()} />}
+        {tab === "team" &&
+          (openAgent ? (
+            <AgentDetail
+              agent={openAgent}
+              entries={entries}
+              onBack={() => setSelectedAgent(undefined)}
+            />
+          ) : (
+            <TeamBoard
+              agents={agents}
+              now={now ?? Date.now()}
+              onSelectAgent={setSelectedAgent}
+            />
+          ))}
         {tab === "pipeline" && <PipelineBoard features={features} />}
         {tab === "conversations" && (
           <Conversations

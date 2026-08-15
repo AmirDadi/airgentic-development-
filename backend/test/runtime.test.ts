@@ -1,9 +1,15 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import Database from "better-sqlite3";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { migrate, listAgents, listFeatures, listMessages } from "../src/db";
+import {
+  migrate,
+  listAgents,
+  listEntries,
+  listFeatures,
+  listMessages,
+} from "../src/db";
 import { createSseHub } from "../src/sse";
 import { buildApp } from "../src/app";
 import { createRuntime } from "../src/runtime";
@@ -414,5 +420,113 @@ describe("createRuntime", () => {
       expect(res.json()).toEqual([expect.objectContaining({ name: "lead" })]);
       await app.close();
     });
+  });
+});
+
+/** A plain assistant text line — becomes an entry, but not a message. */
+function textLine(text: string, ts: string): string {
+  return JSON.stringify({
+    type: "assistant",
+    timestamp: ts,
+    message: { role: "assistant", content: [{ type: "text", text }] },
+  });
+}
+
+describe("createRuntime — entries channel (P3 unit 4)", () => {
+  it("broadcasts {agent, entries} on the `entries` channel after a transcript pass", async () => {
+    const { hub, sent } = fakeHub();
+    const transcript = join(dir, "lead.jsonl");
+    await writeFile(transcript, textLine("working", "2024-01-01T00:00:00.000Z") + "\n", "utf8");
+
+    const runtime = createRuntime(
+      db,
+      baseOptions(hub, { sources: [{ agent: "lead", path: transcript, sessionId: "s1" }] }),
+    );
+    await runtime.tick();
+
+    const broadcasts = sent.filter((b) => b.event === "entries");
+    expect(broadcasts).toHaveLength(1);
+    const payload = broadcasts[0].data as { agent: string; entries: unknown[] };
+    expect(payload.agent).toBe("lead");
+    expect(payload.entries).toEqual(listEntries(db, { agent: "lead" }));
+    expect(payload.entries).toHaveLength(1);
+  });
+
+  it("does not broadcast entries when there are none", async () => {
+    const { hub, sent } = fakeHub();
+    const runtime = createRuntime(db, baseOptions(hub));
+    await runtime.tick();
+
+    expect(sent.some((b) => b.event === "entries")).toBe(false);
+  });
+
+  it("does not re-broadcast entries when nothing changed", async () => {
+    const { hub, sent } = fakeHub();
+    const transcript = join(dir, "lead.jsonl");
+    await writeFile(transcript, textLine("working", "2024-01-01T00:00:00.000Z") + "\n", "utf8");
+
+    const runtime = createRuntime(
+      db,
+      baseOptions(hub, { sources: [{ agent: "lead", path: transcript, sessionId: "s1" }] }),
+    );
+    await runtime.tick();
+    await runtime.tick();
+    await runtime.tick();
+
+    expect(sent.filter((b) => b.event === "entries")).toHaveLength(1);
+  });
+
+  it("a moving poll clock is not a change", async () => {
+    const { hub, sent } = fakeHub();
+    const transcript = join(dir, "lead.jsonl");
+    await writeFile(transcript, textLine("working", "2024-01-01T00:00:00.000Z") + "\n", "utf8");
+
+    let clock = 1_000;
+    const runtime = createRuntime(
+      db,
+      baseOptions(hub, {
+        sources: [{ agent: "lead", path: transcript, sessionId: "s1" }],
+        now: () => {
+          clock += 1_000;
+          return clock;
+        },
+      }),
+    );
+    await runtime.tick();
+    await runtime.tick();
+
+    expect(sent.filter((b) => b.event === "entries")).toHaveLength(1);
+  });
+
+  it("broadcasts ONLY the agent whose entries changed", async () => {
+    const { hub, sent } = fakeHub();
+    const a = join(dir, "lead.jsonl");
+    const b = join(dir, "payments.jsonl");
+    await writeFile(a, textLine("a-one", "2024-01-01T00:00:00.000Z") + "\n", "utf8");
+    await writeFile(b, textLine("b-one", "2024-01-01T00:00:00.000Z") + "\n", "utf8");
+
+    const runtime = createRuntime(
+      db,
+      baseOptions(hub, {
+        sources: [
+          { agent: "lead", path: a, sessionId: "s1" },
+          { agent: "payments", path: b, sessionId: "s2" },
+        ],
+      }),
+    );
+    await runtime.tick();
+    expect(
+      sent.filter((x) => x.event === "entries").map((x) => (x.data as { agent: string }).agent).sort(),
+    ).toEqual(["lead", "payments"]);
+
+    sent.length = 0;
+    await appendFile(b, textLine("b-two", "2024-01-01T00:01:00.000Z") + "\n", "utf8");
+    await runtime.tick();
+
+    const after = sent.filter((x) => x.event === "entries");
+    expect(after).toHaveLength(1);
+    const payload = after[0].data as { agent: string; entries: unknown[] };
+    expect(payload.agent).toBe("payments");
+    expect(payload.entries).toHaveLength(2);
   });
 });

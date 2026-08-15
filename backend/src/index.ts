@@ -16,11 +16,24 @@
  *   TRANSCRIPT_SOURCES  JSON array of {agent, path, sessionId} transcripts to
  *                       tail. Default none — the board still shows agents and
  *                       features without it. Invalid JSON is ignored (logged).
- *   POLL_LIVENESS_MS    Liveness poll interval. Default 2000.
- *   POLL_PIPELINE_MS    Pipeline poll interval. Default 10000.
- *   POLL_TRANSCRIPT_MS  Transcript poll interval. Default 1000.
+ *   UI_DIR              Directory of the built frontend to serve from this
+ *                       same origin. Defaults to ../frontend/dist when that
+ *                       exists, so `npm run build` in both workspaces gives a
+ *                       single URL that serves the dashboard AND its API.
+ *                       The UI fetches same-origin relative paths, so without
+ *                       this there is no URL that serves a working dashboard.
+ *   POLL_LIVENESS_MS    Liveness poll interval.
+ *   POLL_PIPELINE_MS    Pipeline poll interval.
+ *   POLL_TRANSCRIPT_MS  Transcript poll interval.
+ *                       All three default in runtime.ts (DEFAULT_INTERVALS).
+ *                       Deliberately NOT repeated here: when this file also
+ *                       named a default it passed it on every boot, so the
+ *                       runtime default was dead code and tuning it changed
+ *                       nothing in production.
  */
 
+import { existsSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import Database from "better-sqlite3";
 import { buildApp } from "./app.js";
 import { migrate } from "./db.js";
@@ -29,10 +42,15 @@ import { createRuntime } from "./runtime.js";
 import type { TranscriptSource } from "./collectors/transcript.js";
 
 function envNumber(name: string, fallback: number): number {
+  return envNumberOpt(name) ?? fallback;
+}
+
+/** Undefined when unset or invalid, so the callee's own default applies. */
+function envNumberOpt(name: string): number | undefined {
   const raw = process.env[name];
-  if (raw === undefined || raw.trim() === "") return fallback;
+  if (raw === undefined || raw.trim() === "") return undefined;
   const value = Number(raw);
-  return Number.isFinite(value) && value > 0 ? value : fallback;
+  return Number.isFinite(value) && value > 0 ? value : undefined;
 }
 
 /** Parses TRANSCRIPT_SOURCES; bad config must not stop the server booting. */
@@ -65,7 +83,17 @@ migrate(db);
 // One hub, shared by the HTTP fan-out and the collector runtime.
 const hub = createSseHub();
 
-const app = buildApp(db, { hub, logger: true });
+const defaultUiDir = fileURLToPath(new URL("../../frontend/dist", import.meta.url));
+const uiDir =
+  process.env.UI_DIR ?? (existsSync(defaultUiDir) ? defaultUiDir : undefined);
+
+const app = buildApp(db, { hub, logger: true, uiDir });
+if (uiDir === undefined) {
+  app.log.warn(
+    "No built frontend found; serving the API only. Run `npm run build` in " +
+      "frontend/, or set UI_DIR, to serve the dashboard itself.",
+  );
+}
 
 const { sources, error: sourcesError } = parseSources(
   process.env.TRANSCRIPT_SOURCES,
@@ -79,10 +107,11 @@ const runtime = createRuntime(db, {
   session: process.env.TMUX_SESSION ?? "agents",
   specsDir: process.env.SPECS_DIR ?? "specs",
   sources,
+  // Left undefined when unset so runtime.ts owns the cadence in one place.
   intervalMs: {
-    liveness: envNumber("POLL_LIVENESS_MS", 2_000),
-    pipeline: envNumber("POLL_PIPELINE_MS", 10_000),
-    transcript: envNumber("POLL_TRANSCRIPT_MS", 1_000),
+    liveness: envNumberOpt("POLL_LIVENESS_MS"),
+    pipeline: envNumberOpt("POLL_PIPELINE_MS"),
+    transcript: envNumberOpt("POLL_TRANSCRIPT_MS"),
   },
 });
 

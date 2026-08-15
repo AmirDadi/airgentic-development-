@@ -40,8 +40,15 @@ export function TeamBoard(props: {
   agents: Agent[];
   now: number;
   stalledAfterMs?: number;
+  /** Optional: when given, each agent name becomes a button that opens its detail view. */
+  onSelectAgent?: (name: string) => void;
 }): JSX.Element {
-  const { agents, now, stalledAfterMs = DEFAULT_STALLED_AFTER_MS } = props;
+  const {
+    agents,
+    now,
+    stalledAfterMs = DEFAULT_STALLED_AFTER_MS,
+    onSelectAgent,
+  } = props;
 
   return (
     <section aria-label="Team board" className="w-full p-3 sm:p-4">
@@ -63,7 +70,17 @@ export function TeamBoard(props: {
               >
                 <div className="flex items-start justify-between gap-2">
                   <h3 className="min-w-0 break-words text-base font-semibold text-slate-900">
-                    {agent.name}
+                    {onSelectAgent ? (
+                      <button
+                        type="button"
+                        onClick={() => onSelectAgent(agent.name)}
+                        className="break-words text-left underline decoration-slate-300 underline-offset-2 hover:decoration-slate-600"
+                      >
+                        {agent.name}
+                      </button>
+                    ) : (
+                      agent.name
+                    )}
                   </h3>
                   <span
                     data-testid={`agent-health-${agent.name}`}

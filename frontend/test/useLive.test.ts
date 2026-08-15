@@ -43,6 +43,23 @@ describe("useLive", () => {
     expect(onEvent).toHaveBeenCalledWith("agents", [{ name: "payments" }]);
   });
 
+  it("subscribes to the entries channel", () => {
+    const onEvent = vi.fn();
+    renderHook(() => useLive({ onEvent, factory }));
+
+    act(() => {
+      FakeSource.last!.emit(
+        "entries",
+        JSON.stringify({ agent: "payments", entries: [] }),
+      );
+    });
+
+    expect(onEvent).toHaveBeenCalledWith("entries", {
+      agent: "payments",
+      entries: [],
+    });
+  });
+
   it("closes the connection on unmount so refreshes do not leak sockets", () => {
     const { unmount } = renderHook(() => useLive({ onEvent: vi.fn(), factory }));
     const src = FakeSource.last!;

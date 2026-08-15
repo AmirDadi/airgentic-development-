@@ -1,5 +1,6 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { TeamBoard } from "../src/components/TeamBoard";
 import type { Agent } from "../src/types";
 
@@ -105,6 +106,27 @@ describe("TeamBoard", () => {
     render(<TeamBoard now={NOW} agents={[]} />);
 
     expect(screen.getByText(/no agents/i)).toBeInTheDocument();
+  });
+
+  it("makes each agent name a button that reports the selection when onSelectAgent is given", async () => {
+    const onSelectAgent = vi.fn();
+    render(
+      <TeamBoard
+        now={NOW}
+        onSelectAgent={onSelectAgent}
+        agents={[agent({ name: "payments" }), agent({ name: "search" })]}
+      />,
+    );
+
+    await userEvent.click(screen.getByRole("button", { name: "search" }));
+    expect(onSelectAgent).toHaveBeenCalledWith("search");
+  });
+
+  it("renders no agent buttons when onSelectAgent is not given", () => {
+    render(<TeamBoard now={NOW} agents={[agent({ name: "payments" })]} />);
+
+    expect(screen.queryByRole("button", { name: "payments" })).not.toBeInTheDocument();
+    expect(screen.getByText("payments")).toBeInTheDocument();
   });
 
   it("renders every agent when several are present, each with its own health signal", () => {

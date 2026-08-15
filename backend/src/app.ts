@@ -6,12 +6,14 @@ import {
   listEvents,
   listFeatures,
   listMessages,
+  listEntries,
   insertEvent,
 } from "./db.js";
 import { groupIntoThreads } from "./threads.js";
 import type { Event } from "./types.js";
 import { createSseHub, type SseHub } from "./sse.js";
 import { redact } from "./redact.js";
+import fastifyStatic from "@fastify/static";
 
 /**
  * Redacts every string inside an arbitrary hook payload, preserving structure.
@@ -37,6 +39,12 @@ export interface BuildAppOptions {
   hub?: SseHub;
   /** Passed through to Fastify; off by default so tests stay quiet. */
   logger?: FastifyServerOptions["logger"];
+  /**
+   * Directory of the built frontend. When set, the dashboard is served from
+   * this same origin, which is what makes the UI's relative `fetch("/agents")`
+   * work at all. Omitted = API-only mode (what every test uses).
+   */
+  uiDir?: string;
 }
 
 // ajv type coercion is switched off app-wide (see buildApp) so that a body
@@ -56,6 +64,24 @@ const messagesQuerySchema = {
   properties: { a: { type: "string" }, b: { type: "string" }, limit: LIMIT },
   additionalProperties: false,
 } as const;
+
+const entriesQuerySchema = {
+  type: "object",
+  properties: { limit: LIMIT },
+  additionalProperties: false,
+} as const;
+
+/** Every path the API owns. The SPA fallback must never claim one. */
+const API_PREFIXES = [
+  "/health",
+  "/agents",
+  "/features",
+  "/events",
+  "/messages",
+  "/threads",
+  "/ingest",
+  "/live",
+] as const;
 
 function num(v: string | undefined): number | undefined {
   return v === undefined ? undefined : Number(v);
@@ -81,6 +107,14 @@ interface MessagesQuery {
   a?: string;
   b?: string;
   limit?: string;
+}
+
+interface EntriesQuery {
+  limit?: string;
+}
+
+interface AgentParams {
+  name: string;
 }
 
 interface IngestBody {
@@ -121,6 +155,26 @@ export function buildApp(
     { schema: { querystring: messagesQuerySchema } },
     async (req) =>
       listMessages(db, { a: req.query.a, b: req.query.b, limit: num(req.query.limit) }),
+  );
+
+  /**
+   * The agent detail view's feed: every kept transcript entry for one agent,
+   * oldest-first, `?limit=` keeping the newest N.
+   *
+   * `:name` is data, never a path: it is bound as a SQL parameter and used for
+   * an exact-equality lookup, so `..`, a slash or a `%` wildcard are just
+   * agent names that match nothing. An agent we hold no entries for is `200`
+   * with `[]` — having no transcript yet is normal, not an error, and a 404
+   * would make the UI show a failure for a perfectly healthy agent.
+   */
+  app.get<{ Params: AgentParams; Querystring: EntriesQuery }>(
+    "/agents/:name/entries",
+    { schema: { querystring: entriesQuerySchema } },
+    async (req) =>
+      listEntries(db, {
+        agent: req.params.name,
+        limit: num(req.query.limit),
+      }),
   );
 
   app.get("/threads", async () => groupIntoThreads(listMessages(db, {})));
@@ -190,6 +244,34 @@ export function buildApp(
     reply.raw.on("close", cleanup);
     reply.raw.on("error", cleanup);
   });
+
+  // Registered LAST so no API route can be shadowed by the SPA fallback. The
+  // UI fetches same-origin relative paths, so if `/agents` ever resolved to
+  // index.html the client would parse HTML as JSON and report the backend as
+  // unreachable — which is exactly what happened when the UI was served by a
+  // separate dev server with no proxy.
+  if (opts.uiDir !== undefined) {
+    void app.register(fastifyStatic, { root: opts.uiDir, wildcard: false });
+
+    app.setNotFoundHandler((req, reply) => {
+      // Only client-side routes fall back to the app shell. Anything under an
+      // API prefix must still 404 as JSON, so a typo'd or removed endpoint
+      // surfaces as an error instead of silently returning a web page that the
+      // caller then fails to parse as JSON.
+      //
+      // Matched on the PATH, not the accept header: a header-based rule only
+      // holds for clients that happen to send one, and the failure it guards
+      // against is precisely a client receiving HTML it did not expect.
+      const path = req.url.split("?")[0] ?? "";
+      const isApi = API_PREFIXES.some(
+        (p) => path === p || path.startsWith(`${p}/`),
+      );
+      if (req.method !== "GET" || isApi) {
+        return reply.code(404).send({ error: "not found" });
+      }
+      return reply.sendFile("index.html");
+    });
+  }
 
   return app;
 }
