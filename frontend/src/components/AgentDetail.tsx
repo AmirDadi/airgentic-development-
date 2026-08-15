@@ -1,4 +1,5 @@
 import type { Agent, StoredEntry, TranscriptEntry } from "../types";
+import { StopButton } from "./StopButton";
 
 /**
  * Every string below is rendered as a React child — React escapes it. Nothing
@@ -160,8 +161,14 @@ export function AgentDetail(props: {
   agent: Agent;
   entries: StoredEntry[];
   onBack?: () => void;
+  /** Optional: when given, a confirm-guarded Stop control for this agent. */
+  onStopAgent?: (name: string) => void;
+  /** A stop for this agent is in flight. */
+  stopping?: boolean;
+  /** A standing reason Stop is unavailable (e.g. a 503 seen once). */
+  stopDisabledReason?: string;
 }): JSX.Element {
-  const { agent, entries, onBack } = props;
+  const { agent, entries, onBack, onStopAgent, stopping = false, stopDisabledReason } = props;
 
   // Mid-turn iff the stream has entries and the newest is not a turn boundary.
   // Order is the backend's (oldest first); never re-sorted here.
@@ -202,6 +209,18 @@ export function AgentDetail(props: {
           />
           {working ? "working" : "idle"}
         </span>
+
+        {onStopAgent && (
+          <div className="ml-auto text-right">
+            <StopButton
+              agent={agent.name}
+              alive={agent.alive}
+              onStop={onStopAgent}
+              busy={stopping}
+              disabledReason={stopDisabledReason}
+            />
+          </div>
+        )}
       </div>
 
       {entries.length === 0 ? (

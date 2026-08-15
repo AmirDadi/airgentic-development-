@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import Database from "better-sqlite3";
+import { FIELD_SEP } from "../src/tmux.js";
 import { appendFile, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -93,7 +94,7 @@ function fakeTimers(): {
 
 /** tmux stdout for one window per agent name. */
 function tmuxOutput(names: string[]): string {
-  return names.map((n, i) => `${i}\t${n}\t${i === 0 ? 1 : 0}\tnode`).join("\n");
+  return names.map((n, i) => [i, n, i === 0 ? 1 : 0, "node"].join(FIELD_SEP)).join("\n");
 }
 
 /** One assistant `tool_use: SendMessage` line — an OUTBOUND message. */

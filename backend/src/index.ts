@@ -11,6 +11,11 @@
  *   PORT                HTTP port. Default 8787.
  *   HOST                Bind address. Default "0.0.0.0".
  *   TMUX_SESSION        tmux session whose windows are the agents. Default "agents".
+ *   ENABLE_STOP         Set truthy to enable the Stop control (POST
+ *                       /agents/:name/stop sends C-c to the agent's tmux
+ *                       window). OFF by default: Stop writes into an agent's
+ *                       runtime, so a deployment must opt in. Unset = 503, and
+ *                       it MUST sit behind the deployment's own access control.
  *   SPECS_DIR           Directory scanned for `<feature>.{spec,interfaces,plan}.md`.
  *                       Default "specs".
  *   TRANSCRIPT_SOURCES  JSON array of {agent, path, sessionId} transcripts to
@@ -45,7 +50,7 @@ import Database from "better-sqlite3";
 import { buildApp } from "./app.js";
 import { migrate } from "./db.js";
 import { createSseHub } from "./sse.js";
-import { createRuntime } from "./runtime.js";
+import { createRuntime, defaultRunner } from "./runtime.js";
 import { createBridge } from "./chat/bridge.js";
 import type { TranscriptSource } from "./collectors/transcript.js";
 
@@ -107,7 +112,24 @@ const chat =
         timeoutMs: envNumberOpt("WEB_LEAD_TIMEOUT_MS"),
       });
 
-const app = buildApp(db, { hub, logger: true, uiDir, chat });
+const tmuxSession = process.env.TMUX_SESSION ?? "agents";
+// Stop is a write into an agent's runtime, so it is opt-in: off unless
+// ENABLE_STOP is explicitly set. It still must sit behind the deployment's
+// access control (there is no app-layer auth — see PRD Q2).
+const stopEnabled = /^(1|true|yes|on)$/i.test(process.env.ENABLE_STOP ?? "");
+const stop = stopEnabled
+  ? { session: tmuxSession, runner: defaultRunner }
+  : undefined;
+
+const app = buildApp(db, { hub, logger: true, uiDir, chat, stop });
+if (stop === undefined) {
+  app.log.info("ENABLE_STOP not set; Stop disabled (POST /agents/:name/stop -> 503).");
+} else {
+  app.log.warn(
+    `Stop control ENABLED for tmux session "${tmuxSession}" — a write path; ` +
+      "ensure this dashboard is behind access control.",
+  );
+}
 if (chat === undefined) {
   app.log.info("WEB_LEAD_DIR not set; web chat disabled (POST /chat -> 503).");
 } else {
@@ -130,7 +152,7 @@ if (sourcesError !== null) {
 
 const runtime = createRuntime(db, {
   hub,
-  session: process.env.TMUX_SESSION ?? "agents",
+  session: tmuxSession,
   specsDir: process.env.SPECS_DIR ?? "specs",
   sources,
   // Left undefined when unset so runtime.ts owns the cadence in one place.

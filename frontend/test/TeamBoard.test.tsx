@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { TeamBoard } from "../src/components/TeamBoard";
 import type { Agent } from "../src/types";
@@ -127,6 +127,61 @@ describe("TeamBoard", () => {
 
     expect(screen.queryByRole("button", { name: "payments" })).not.toBeInTheDocument();
     expect(screen.getByText("payments")).toBeInTheDocument();
+  });
+
+  it("renders no Stop control when onStopAgent is not given", () => {
+    render(<TeamBoard now={NOW} agents={[agent({ name: "payments" })]} />);
+
+    expect(screen.queryByRole("button", { name: /stop payments/i })).not.toBeInTheDocument();
+  });
+
+  it("surfaces a Stop control per card, guarded by a confirm dialog, when onStopAgent is given", async () => {
+    const onStopAgent = vi.fn();
+    render(
+      <TeamBoard
+        now={NOW}
+        onStopAgent={onStopAgent}
+        agents={[agent({ name: "payments" }), agent({ name: "search" })]}
+      />,
+    );
+
+    expect(screen.getByRole("button", { name: /stop payments/i })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /stop search/i })).toBeInTheDocument();
+
+    // Clicking Stop only opens the confirmation; the interrupt does not fire yet.
+    await userEvent.click(screen.getByRole("button", { name: /stop search/i }));
+    expect(onStopAgent).not.toHaveBeenCalled();
+
+    const dialog = screen.getByRole("dialog");
+    expect(dialog).toHaveAccessibleName(/search/i);
+    await userEvent.click(within(dialog).getByRole("button", { name: /confirm/i }));
+    expect(onStopAgent).toHaveBeenCalledWith("search");
+  });
+
+  it("disables Stop for a dead agent — there is nothing to interrupt", () => {
+    render(
+      <TeamBoard
+        now={NOW}
+        onStopAgent={vi.fn()}
+        agents={[agent({ name: "payments", alive: false })]}
+      />,
+    );
+
+    expect(screen.getByRole("button", { name: /stop payments/i })).toBeDisabled();
+  });
+
+  it("shows a standing reason and disables Stop when the server reports it unconfigured", () => {
+    render(
+      <TeamBoard
+        now={NOW}
+        onStopAgent={vi.fn()}
+        stopDisabledReason="Stop is not configured on this server."
+        agents={[agent({ name: "payments" })]}
+      />,
+    );
+
+    expect(screen.getByRole("button", { name: /stop payments/i })).toBeDisabled();
+    expect(screen.getByText(/not configured/i)).toBeInTheDocument();
   });
 
   it("renders every agent when several are present, each with its own health signal", () => {

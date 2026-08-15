@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { AgentDetail } from "../src/components/AgentDetail";
 import type { Agent, StoredEntry, TranscriptEntry } from "../src/types";
@@ -321,6 +321,37 @@ describe("AgentDetail", () => {
     render(<AgentDetail agent={agent()} entries={[]} />);
 
     expect(screen.getByRole("status", { name: /payments is idle/i })).toBeInTheDocument();
+  });
+
+  it("renders no Stop control when onStopAgent is not given", () => {
+    render(<AgentDetail agent={agent()} entries={[]} />);
+
+    expect(screen.queryByRole("button", { name: /stop payments/i })).not.toBeInTheDocument();
+  });
+
+  it("offers a Stop control guarded by a confirm dialog naming the agent", async () => {
+    const onStopAgent = vi.fn();
+    render(<AgentDetail agent={agent()} entries={[]} onStopAgent={onStopAgent} />);
+
+    await userEvent.click(screen.getByRole("button", { name: /stop payments/i }));
+    expect(onStopAgent).not.toHaveBeenCalled();
+
+    const dialog = screen.getByRole("dialog");
+    expect(dialog).toHaveAccessibleName(/payments/i);
+    await userEvent.click(within(dialog).getByRole("button", { name: /confirm/i }));
+    expect(onStopAgent).toHaveBeenCalledWith("payments");
+  });
+
+  it("disables Stop for a dead agent in the detail view", () => {
+    render(
+      <AgentDetail
+        agent={agent({ alive: false })}
+        entries={[]}
+        onStopAgent={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByRole("button", { name: /stop payments/i })).toBeDisabled();
   });
 
   it("renders script-looking text as literal text and creates no script element", () => {

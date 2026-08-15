@@ -18,6 +18,7 @@ import type { Event, Message } from "../src/types.js";
 import { buildApp } from "../src/app.js";
 import { createSseHub, type SseHub } from "../src/sse.js";
 import type { TurnResult } from "../src/chat/bridge.js";
+import type { CommandRunner } from "../src/collectors/liveness.js";
 
 function makeDb(): Database.Database {
   const db = new Database(":memory:");
@@ -1154,6 +1155,248 @@ describe("chat persistence", () => {
     const threads = (await app.inject({ method: "GET", url: "/threads" })).json();
     expect(Array.isArray(threads)).toBe(true);
     expect(JSON.stringify(threads)).toContain("web-lead");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P5 — Stop control. The runner is always injected: no test may ever exec a
+// real tmux. Stopping = interrupt (send-keys C-c), never kill.
+// ---------------------------------------------------------------------------
+
+const STOP_SESSION = "air-team";
+
+/** A runner that always succeeds, recording every argv it was handed. */
+function okStopRunner(): CommandRunner & { calls: string[][] } {
+  const calls: string[][] = [];
+  const run = (async (argv: string[]) => {
+    calls.push(argv);
+    return "";
+  }) as CommandRunner & { calls: string[][] };
+  run.calls = calls;
+  return run;
+}
+
+/** A runner that throws, as tmux would with no server running. */
+function failingStopRunner(): CommandRunner & { calls: string[][] } {
+  const calls: string[][] = [];
+  const run = (async (argv: string[]) => {
+    calls.push(argv);
+    throw new Error("no server running");
+  }) as CommandRunner & { calls: string[][] };
+  run.calls = calls;
+  return run;
+}
+
+function makeStopApp(
+  stop?: { session: string; runner: CommandRunner },
+  hub?: SseHub,
+): { app: FastifyInstance; db: Database.Database } {
+  const db = makeDb();
+  return { app: buildApp(db, { stop, hub }), db };
+}
+
+describe("POST /agents/:name/stop", () => {
+  it("interrupts a known agent and returns 200 with the audit event", async () => {
+    const runner = okStopRunner();
+    const { app, db } = makeStopApp({ session: STOP_SESSION, runner });
+    upsertAgent(db, {
+      name: "payments",
+      kind: "claude",
+      workdir: "/w",
+      alive: true,
+      last_seen: 1,
+      current_activity: null,
+    });
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/agents/payments/stop",
+      payload: { actor: "Amirreza" },
+    });
+
+    expect(res.statusCode).toBe(200);
+    // Exactly the interrupt argv — send-keys C-c, never a kill verb.
+    expect(runner.calls).toEqual([
+      ["tmux", "send-keys", "-t", "air-team:payments", "C-c"],
+    ]);
+
+    // The audit row is persisted and readable back.
+    const events = (await app.inject({ method: "GET", url: "/events" })).json();
+    expect(events).toHaveLength(1);
+    expect(events[0].type).toBe("agent_stopped");
+    expect(events[0].agent).toBe("payments");
+    expect(events[0].payload).toMatchObject({ actor: "Amirreza" });
+  });
+
+  it("defaults the actor to 'web' when the body omits it", async () => {
+    const { app, db } = makeStopApp({ session: STOP_SESSION, runner: okStopRunner() });
+    upsertAgent(db, {
+      name: "payments",
+      kind: "claude",
+      workdir: "/w",
+      alive: true,
+      last_seen: 1,
+      current_activity: null,
+    });
+
+    const res = await app.inject({ method: "POST", url: "/agents/payments/stop", payload: {} });
+    expect(res.statusCode).toBe(200);
+    const events = (await app.inject({ method: "GET", url: "/events" })).json();
+    expect(events[0].payload).toMatchObject({ actor: "web" });
+  });
+
+  it("404s an unknown agent without running anything or auditing", async () => {
+    const runner = okStopRunner();
+    const { app } = makeStopApp({ session: STOP_SESSION, runner });
+
+    const res = await app.inject({ method: "POST", url: "/agents/ghost/stop", payload: {} });
+    expect(res.statusCode).toBe(404);
+    expect(typeof res.json().error).toBe("string");
+    expect(runner.calls).toHaveLength(0);
+
+    const events = (await app.inject({ method: "GET", url: "/events" })).json();
+    expect(events).toEqual([]);
+  });
+
+  it("broadcasts the audit event on the SSE hub for the live timeline", async () => {
+    const hub = createSseHub();
+    const send = vi.fn();
+    hub.subscribe(send);
+    const { app, db } = makeStopApp({ session: STOP_SESSION, runner: okStopRunner() }, hub);
+    upsertAgent(db, {
+      name: "payments",
+      kind: "claude",
+      workdir: "/w",
+      alive: true,
+      last_seen: 1,
+      current_activity: null,
+    });
+
+    await app.inject({ method: "POST", url: "/agents/payments/stop", payload: {} });
+
+    expect(send).toHaveBeenCalledTimes(1);
+    const [name, data] = send.mock.calls[0] as [string, { type: string }];
+    // Must match the channel the timeline subscribes to.
+    expect(name).toBe("events");
+    expect(data.type).toBe("agent_stopped");
+  });
+
+  it("does not broadcast anything for an unknown agent", async () => {
+    const hub = createSseHub();
+    const send = vi.fn();
+    hub.subscribe(send);
+    const { app } = makeStopApp({ session: STOP_SESSION, runner: okStopRunner() }, hub);
+
+    await app.inject({ method: "POST", url: "/agents/ghost/stop", payload: {} });
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it("returns 503 with a JSON error when Stop is not configured", async () => {
+    // No stop capability injected — the rest of the dashboard still works.
+    const { app, db } = makeStopApp();
+    upsertAgent(db, {
+      name: "payments",
+      kind: "claude",
+      workdir: "/w",
+      alive: true,
+      last_seen: 1,
+      current_activity: null,
+    });
+
+    const res = await app.inject({ method: "POST", url: "/agents/payments/stop", payload: {} });
+    expect(res.statusCode).toBe(503);
+    expect(typeof res.json().error).toBe("string");
+    expect(res.json().error.length).toBeGreaterThan(0);
+  });
+
+  it("leaves the rest of the dashboard working with no Stop configured", async () => {
+    const { app } = makeStopApp();
+    expect((await app.inject({ method: "GET", url: "/health" })).statusCode).toBe(200);
+    expect((await app.inject({ method: "GET", url: "/agents" })).statusCode).toBe(200);
+  });
+
+  it("surfaces a runner failure without a success audit row", async () => {
+    const runner = failingStopRunner();
+    const { app, db } = makeStopApp({ session: STOP_SESSION, runner });
+    upsertAgent(db, {
+      name: "payments",
+      kind: "claude",
+      workdir: "/w",
+      alive: true,
+      last_seen: 1,
+      current_activity: null,
+    });
+
+    const res = await app.inject({ method: "POST", url: "/agents/payments/stop", payload: {} });
+    // tmux down is an upstream failure, not a client error.
+    expect(res.statusCode).toBe(502);
+    expect(typeof res.json().error).toBe("string");
+
+    const events = (await app.inject({ method: "GET", url: "/events" })).json();
+    for (const e of events) expect(e.type).not.toBe("agent_stopped");
+    // The attempt is still audited, as a clearly-failure type.
+    expect(events.some((e: Event) => e.type === "agent_stop_failed")).toBe(true);
+  });
+
+  it("rejects a non-string actor with 400", async () => {
+    const { app, db } = makeStopApp({ session: STOP_SESSION, runner: okStopRunner() });
+    upsertAgent(db, {
+      name: "payments",
+      kind: "claude",
+      workdir: "/w",
+      alive: true,
+      last_seen: 1,
+      current_activity: null,
+    });
+    const res = await app.inject({
+      method: "POST",
+      url: "/agents/payments/stop",
+      payload: { actor: 7 },
+    });
+    expect(res.statusCode).toBe(400);
+  });
+
+  it("rejects an empty-string actor with 400", async () => {
+    const { app, db } = makeStopApp({ session: STOP_SESSION, runner: okStopRunner() });
+    upsertAgent(db, {
+      name: "payments",
+      kind: "claude",
+      workdir: "/w",
+      alive: true,
+      last_seen: 1,
+      current_activity: null,
+    });
+    const res = await app.inject({
+      method: "POST",
+      url: "/agents/payments/stop",
+      payload: { actor: "" },
+    });
+    expect(res.statusCode).toBe(400);
+  });
+
+  it("treats a traversal-ish or wildcard :name as a plain unknown agent (404), never a shell", async () => {
+    const runner = okStopRunner();
+    const { app, db } = makeStopApp({ session: STOP_SESSION, runner });
+    upsertAgent(db, {
+      name: "payments",
+      kind: "claude",
+      workdir: "/w",
+      alive: true,
+      last_seen: 1,
+      current_activity: null,
+    });
+
+    for (const name of ["..", "%2e%2e", "a%2Fb", "*", "%25", "payments%20"]) {
+      const res = await app.inject({
+        method: "POST",
+        url: `/agents/${name}/stop`,
+        payload: {},
+      });
+      // Either the router never matches, or the name misses every known agent.
+      expect([404], name).toContain(res.statusCode);
+    }
+    // A crafted name never became a command.
+    expect(runner.calls).toHaveLength(0);
   });
 });
 

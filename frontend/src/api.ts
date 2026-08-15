@@ -84,6 +84,14 @@ export interface ChatAccepted {
   turnId: string;
 }
 
+/** The audit event the backend returns after interrupting an agent. */
+export interface StopAccepted {
+  id: string;
+  type: string;
+  agent: string;
+  ts: number;
+}
+
 export interface ApiClient {
   agents(): Promise<Agent[]>;
   features(): Promise<Feature[]>;
@@ -93,6 +101,12 @@ export interface ApiClient {
   agentEntries(name: string, limit?: number): Promise<StoredEntry[]>;
   /** Queues one chat turn for the web lead. Rejects with 503 if none is configured. */
   sendChat(text: string, user?: string): Promise<ChatAccepted>;
+  /**
+   * Interrupts one agent's current turn. Resolves with the audit event on
+   * success; rejects with 404 for an unknown agent and 503 when Stop is not
+   * configured on the server.
+   */
+  stopAgent(name: string, actor?: string): Promise<StopAccepted>;
   /** Oldest-first `human_web` messages, both sides of the conversation. */
   chatHistory(): Promise<Message[]>;
 }
@@ -129,5 +143,15 @@ export function createApi(opts: ApiOptions = {}): ApiClient {
         cfg,
       ),
     chatHistory: () => get<Message[]>("/chat/history", cfg),
+    // The name is a path segment, so it is encoded — a crafted name cannot
+    // silently address a different route. `actor` is omitted rather than sent
+    // as undefined so the backend applies its own default when the browser has
+    // nobody to name for the audit trail.
+    stopAgent: (name: string, actor?: string) =>
+      post<StopAccepted>(
+        `/agents/${encodeURIComponent(name)}/stop`,
+        actor === undefined ? {} : { actor },
+        cfg,
+      ),
   };
 }
