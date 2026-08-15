@@ -172,9 +172,14 @@ layers (P1–P4) are proven, per the risk this carries (see R5 below).
 - **R1** — Transcript JSONL format is internal/undocumented → isolate
   parsing behind a tested `transcript-parser` module with fixture-based
   contract tests.
-- **R2** — Unknown whether an Agent-SDK-driven session counts as "attended"
-  for cross-session messaging → spike before committing to the chat-bridge
-  design; fallback is tmux `send-keys` injection.
+- **R2** — ~~Unknown whether an Agent-SDK-driven session counts as "attended"
+  for cross-session messaging~~ → **RESOLVED, it does** (`docs/SPIKE-R2.md`).
+  A headless session binds its own inbox socket, discovers peers via
+  `ListAgents`, and `SendMessage` was verified end-to-end by receipt in the
+  target session. Option B is the design; the tmux `send-keys` fallback is no
+  longer needed and should not be built. Residual risk moves to *lifecycle*:
+  the socket lives only as long as the process, so the bridge owns restarting
+  its session and re-advertising it.
 - **R3** — Concurrent web chats interleaving in one lead's context →
   serialize turns server-side, name-tag messages.
 - **R4** — Secrets leaking from transcripts into the UI → mandatory
