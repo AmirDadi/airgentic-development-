@@ -100,3 +100,47 @@ describe("live entries frames vs. the history already on screen", () => {
     expect(screen.getAllByText("line 1")).toHaveLength(1);
   });
 });
+
+describe("initial snapshot vs. an SSE frame that arrives first", () => {
+  it("does not let a slow REST snapshot overwrite newer live entries", async () => {
+    // Opening an agent starts a REST fetch. If a live frame lands while that
+    // fetch is still in flight, the snapshot is already stale by the time it
+    // resolves — replacing state with it makes output the user just watched
+    // arrive disappear again.
+    let emit: ((e: { data: string }) => void) | undefined;
+    const factory = () => ({
+      addEventListener(type: string, cb: (e: { data: string }) => void) {
+        if (type === "entries") emit = cb;
+      },
+      close() {},
+    });
+
+    const api = {
+      agents: vi.fn(async () => [agent]),
+      features: vi.fn(async () => []),
+      threads: vi.fn(async () => []),
+      events: vi.fn(async () => []),
+      // Slow: resolves with the PRE-frame snapshot after the frame lands.
+      agentEntries: vi.fn(
+        () =>
+          new Promise<StoredEntry[]>((resolve) =>
+            setTimeout(() => resolve([entry(1)]), 60),
+          ),
+      ),
+    } as unknown as ApiClient;
+
+    render(<App api={api} liveFactory={factory} now={2_000} />);
+    await userEvent.click(await screen.findByRole("button", { name: "payments" }));
+
+    // Live frame arrives while the snapshot request is still outstanding.
+    emit!({
+      data: JSON.stringify({ agent: "payments", entries: [entry(1), entry(2)] }),
+    });
+    await screen.findByText("line 2");
+
+    // ...and must still be there once the stale snapshot resolves.
+    await new Promise((r) => setTimeout(r, 120));
+    expect(screen.getByText("line 2")).toBeInTheDocument();
+    expect(screen.getByText("line 1")).toBeInTheDocument();
+  });
+});

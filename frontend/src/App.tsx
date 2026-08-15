@@ -79,8 +79,18 @@ export default function App({ api, liveFactory, now }: AppProps = {}) {
     let cancelled = false;
     (async () => {
       try {
-        const e = await client.agentEntries(selectedAgent);
-        if (!cancelled) setEntries(e);
+        const snapshot = await client.agentEntries(selectedAgent);
+        if (cancelled) return;
+        // MERGE for the same reason live frames do. This request was issued
+        // before it resolved, so a frame may have landed meanwhile and the
+        // snapshot is already stale — replacing would make output the user
+        // just watched arrive disappear again. The snapshot is the older,
+        // authoritative history; anything live we hold beyond it is newer.
+        setEntries((prev) => {
+          const snapshotIds = new Set(snapshot.map((e) => e.id));
+          const newer = prev.filter((e) => !snapshotIds.has(e.id));
+          return [...snapshot, ...newer];
+        });
       } catch {
         if (!cancelled) setEntries([]);
       }
