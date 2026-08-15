@@ -1,4 +1,4 @@
-import type { Agent, Feature, StoredEntry } from "./types";
+import type { Agent, Feature, Message, StoredEntry } from "./types";
 
 /**
  * Every failure the client can produce — HTTP, network, or malformed body —
@@ -47,6 +47,43 @@ async function get<T>(
   }
 }
 
+async function post<T>(
+  path: string,
+  body: unknown,
+  opts: Required<Pick<ApiOptions, "baseUrl">> & { fetch: typeof fetch },
+): Promise<T> {
+  const url = `${opts.baseUrl}${path}`;
+
+  let res: Awaited<ReturnType<typeof fetch>>;
+  try {
+    res = await opts.fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json", accept: "application/json" },
+      body: JSON.stringify(body),
+    });
+  } catch (cause) {
+    throw new ApiError(`Request to ${url} failed`, null, cause);
+  }
+
+  // 202 is the success case for /chat, and `ok` already covers it. A 503 here
+  // means "no lead configured" — the caller reads `status` rather than the
+  // message, so it keeps its own wording.
+  if (!res.ok) {
+    throw new ApiError(`Request to ${url} failed`, res.status);
+  }
+
+  try {
+    return (await res.json()) as T;
+  } catch (cause) {
+    throw new ApiError(`Malformed JSON from ${url}`, res.status, cause);
+  }
+}
+
+/** The backend's answer to an accepted chat turn. */
+export interface ChatAccepted {
+  turnId: string;
+}
+
 export interface ApiClient {
   agents(): Promise<Agent[]>;
   features(): Promise<Feature[]>;
@@ -54,6 +91,10 @@ export interface ApiClient {
   events(since?: number): Promise<unknown[]>;
   /** Oldest-first transcript entries for one agent. */
   agentEntries(name: string, limit?: number): Promise<StoredEntry[]>;
+  /** Queues one chat turn for the web lead. Rejects with 503 if none is configured. */
+  sendChat(text: string, user?: string): Promise<ChatAccepted>;
+  /** Oldest-first `human_web` messages, both sides of the conversation. */
+  chatHistory(): Promise<Message[]>;
 }
 
 export function createApi(opts: ApiOptions = {}): ApiClient {
@@ -79,5 +120,14 @@ export function createApi(opts: ApiOptions = {}): ApiClient {
           (limit === undefined ? "" : `?limit=${limit}`),
         cfg,
       ),
+    // `user` is omitted rather than sent as undefined/null, so the backend's
+    // own default naming applies when the browser has nobody to name.
+    sendChat: (text: string, user?: string) =>
+      post<ChatAccepted>(
+        "/chat",
+        user === undefined ? { text } : { text, user },
+        cfg,
+      ),
+    chatHistory: () => get<Message[]>("/chat/history", cfg),
   };
 }

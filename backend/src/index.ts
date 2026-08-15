@@ -16,6 +16,13 @@
  *   TRANSCRIPT_SOURCES  JSON array of {agent, path, sessionId} transcripts to
  *                       tail. Default none — the board still shows agents and
  *                       features without it. Invalid JSON is ignored (logged).
+ *   WEB_LEAD_DIR        Working directory for the web-lead chat session. Set
+ *                       to enable the chat drawer; UNSET = chat disabled and
+ *                       POST /chat answers 503, with the rest of the dashboard
+ *                       unaffected. Give it its OWN directory: `--continue`
+ *                       scope is per-directory, so this both isolates the
+ *                       lead's history and keeps its context (and usage) small.
+ *   WEB_LEAD_TIMEOUT_MS Per-turn timeout. Default 120000.
  *   UI_DIR              Directory of the built frontend to serve from this
  *                       same origin. Defaults to ../frontend/dist when that
  *                       exists, so `npm run build` in both workspaces gives a
@@ -32,13 +39,14 @@
  *                       nothing in production.
  */
 
-import { existsSync } from "node:fs";
+import { existsSync, mkdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import Database from "better-sqlite3";
 import { buildApp } from "./app.js";
 import { migrate } from "./db.js";
 import { createSseHub } from "./sse.js";
 import { createRuntime } from "./runtime.js";
+import { createBridge } from "./chat/bridge.js";
 import type { TranscriptSource } from "./collectors/transcript.js";
 
 function envNumber(name: string, fallback: number): number {
@@ -87,7 +95,25 @@ const defaultUiDir = fileURLToPath(new URL("../../frontend/dist", import.meta.ur
 const uiDir =
   process.env.UI_DIR ?? (existsSync(defaultUiDir) ? defaultUiDir : undefined);
 
-const app = buildApp(db, { hub, logger: true, uiDir });
+// The chat bridge spawns a real `claude` process per turn, so it is only
+// constructed when a directory is configured. Without one the dashboard runs
+// exactly as before and POST /chat answers 503.
+const webLeadDir = process.env.WEB_LEAD_DIR?.trim();
+const chat =
+  webLeadDir === undefined || webLeadDir === ""
+    ? undefined
+    : createBridge({
+        cwd: webLeadDir,
+        timeoutMs: envNumberOpt("WEB_LEAD_TIMEOUT_MS"),
+      });
+
+const app = buildApp(db, { hub, logger: true, uiDir, chat });
+if (chat === undefined) {
+  app.log.info("WEB_LEAD_DIR not set; web chat disabled (POST /chat -> 503).");
+} else {
+  mkdirSync(webLeadDir as string, { recursive: true });
+  app.log.info(`web-lead chat enabled, session dir ${webLeadDir}`);
+}
 if (uiDir === undefined) {
   app.log.warn(
     "No built frontend found; serving the API only. Run `npm run build` in " +

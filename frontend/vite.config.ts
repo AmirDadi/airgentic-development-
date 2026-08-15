@@ -13,6 +13,8 @@ const API_PATHS = [
   "/messages",
   "/threads",
   "/ingest",
+  // Prefix-matched, so this also covers `/chat/history`.
+  "/chat",
   "/live",
 ];
 

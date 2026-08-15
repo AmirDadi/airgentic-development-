@@ -11,11 +11,13 @@ import {
   upsertAgent,
   upsertFeature,
   insertEntries,
+  listMessages,
   type StoredEntry,
 } from "../src/db.js";
 import type { Event, Message } from "../src/types.js";
 import { buildApp } from "../src/app.js";
 import { createSseHub, type SseHub } from "../src/sse.js";
+import type { TurnResult } from "../src/chat/bridge.js";
 
 function makeDb(): Database.Database {
   const db = new Database(":memory:");
@@ -772,5 +774,405 @@ describe("serving the dashboard UI", () => {
     const app = buildApp(db);
     expect((await app.inject({ method: "GET", url: "/health" })).statusCode).toBe(200);
     expect((await app.inject({ method: "GET", url: "/" })).statusCode).toBe(404);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P4 — web chat bridge. The bridge is always injected: no test may ever spawn
+// a real `claude` process.
+// ---------------------------------------------------------------------------
+
+interface FakeBridge {
+  runTurn(prompt: string, onDelta: (text: string) => void): Promise<TurnResult>;
+  prompts: string[];
+  concurrent: number;
+  maxConcurrent: number;
+}
+
+/**
+ * A bridge stand-in. `respond` decides what one turn does; it is handed the
+ * prompt and the delta sink so a test can drive streaming precisely.
+ */
+function fakeBridge(
+  respond: (
+    prompt: string,
+    onDelta: (text: string) => void,
+  ) => Promise<TurnResult> = async () => ({ ok: true, text: "pong", usage: 0.01 }),
+): FakeBridge {
+  const b: FakeBridge = {
+    prompts: [],
+    concurrent: 0,
+    maxConcurrent: 0,
+    async runTurn(prompt, onDelta) {
+      b.prompts.push(prompt);
+      b.concurrent++;
+      b.maxConcurrent = Math.max(b.maxConcurrent, b.concurrent);
+      try {
+        return await respond(prompt, onDelta);
+      } finally {
+        b.concurrent--;
+      }
+    },
+  };
+  return b;
+}
+
+function makeChatApp(bridge?: FakeBridge, hub?: SseHub): {
+  app: FastifyInstance;
+  db: Database.Database;
+} {
+  const db = makeDb();
+  return { app: buildApp(db, { chat: bridge, hub }), db };
+}
+
+describe("POST /chat", () => {
+  it("accepts a message with 202 and a turn id", async () => {
+    const { app } = makeChatApp(fakeBridge());
+    const res = await app.inject({ method: "POST", url: "/chat", payload: { text: "hi" } });
+
+    expect(res.statusCode).toBe(202);
+    const body = res.json();
+    expect(typeof body.turnId).toBe("string");
+    expect(body.turnId.length).toBeGreaterThan(0);
+  });
+
+  it("generates a distinct turn id per message", async () => {
+    const { app } = makeChatApp(fakeBridge());
+    const ids = new Set<string>();
+    for (let i = 0; i < 3; i++) {
+      const res = await app.inject({ method: "POST", url: "/chat", payload: { text: `m${i}` } });
+      ids.add(res.json().turnId);
+    }
+    expect(ids.size).toBe(3);
+  });
+
+  it("rejects an empty or whitespace-only text with 400", async () => {
+    const { app } = makeChatApp(fakeBridge());
+    for (const text of ["", "   ", "\n\t "]) {
+      const res = await app.inject({ method: "POST", url: "/chat", payload: { text } });
+      expect(res.statusCode, JSON.stringify(text)).toBe(400);
+    }
+  });
+
+  it("rejects a missing or non-string text with 400", async () => {
+    const { app } = makeChatApp(fakeBridge());
+    for (const payload of [{}, { text: 42 }, { text: null }, { text: ["hi"] }, { text: { a: 1 } }]) {
+      const res = await app.inject({ method: "POST", url: "/chat", payload });
+      expect(res.statusCode, JSON.stringify(payload)).toBe(400);
+    }
+  });
+
+  it("rejects a non-string user with 400", async () => {
+    const { app } = makeChatApp(fakeBridge());
+    const res = await app.inject({
+      method: "POST",
+      url: "/chat",
+      payload: { text: "hi", user: 7 },
+    });
+    expect(res.statusCode).toBe(400);
+  });
+
+  it("rejects a non-object body with 400", async () => {
+    const { app } = makeChatApp(fakeBridge());
+    const res = await app.inject({
+      method: "POST",
+      url: "/chat",
+      headers: { "content-type": "application/json" },
+      payload: JSON.stringify("hi"),
+    });
+    expect(res.statusCode).toBe(400);
+  });
+
+  it("returns 503 with a JSON error when no bridge is configured", async () => {
+    const { app } = makeChatApp();
+    const res = await app.inject({ method: "POST", url: "/chat", payload: { text: "hi" } });
+    expect(res.statusCode).toBe(503);
+    expect(typeof res.json().error).toBe("string");
+    expect(res.json().error.length).toBeGreaterThan(0);
+  });
+
+  it("leaves the rest of the dashboard working with no bridge configured", async () => {
+    const { app } = makeChatApp();
+    expect((await app.inject({ method: "GET", url: "/health" })).statusCode).toBe(200);
+    expect((await app.inject({ method: "GET", url: "/agents" })).statusCode).toBe(200);
+    expect((await app.inject({ method: "GET", url: "/chat/history" })).statusCode).toBe(200);
+  });
+
+  it("name-tags the prompt so the lead knows who is speaking", async () => {
+    const bridge = fakeBridge();
+    const { app } = makeChatApp(bridge);
+
+    await app.inject({ method: "POST", url: "/chat", payload: { text: "ship it", user: "Amirreza" } });
+    await vi.waitFor(() => expect(bridge.prompts).toHaveLength(1));
+    expect(bridge.prompts[0]).toBe("Amirreza: ship it");
+  });
+
+  it("defaults the speaker to 'web'", async () => {
+    const bridge = fakeBridge();
+    const { app } = makeChatApp(bridge);
+
+    await app.inject({ method: "POST", url: "/chat", payload: { text: "hello" } });
+    await vi.waitFor(() => expect(bridge.prompts).toHaveLength(1));
+    expect(bridge.prompts[0]).toBe("web: hello");
+  });
+
+  it("serialises turns — two overlapping messages never run at once (R3)", async () => {
+    let release: (() => void) | undefined;
+    const bridge = fakeBridge(async (prompt) => {
+      if (prompt.includes("first")) {
+        await new Promise<void>((res) => {
+          release = res;
+        });
+      }
+      return { ok: true, text: `re: ${prompt}`, usage: null };
+    });
+    const { app } = makeChatApp(bridge);
+
+    await app.inject({ method: "POST", url: "/chat", payload: { text: "first" } });
+    await app.inject({ method: "POST", url: "/chat", payload: { text: "second" } });
+
+    await vi.waitFor(() => expect(release).toBeDefined());
+    expect(bridge.prompts).toHaveLength(1);
+
+    release?.();
+    await vi.waitFor(() => expect(bridge.prompts).toHaveLength(2));
+    expect(bridge.maxConcurrent).toBe(1);
+    expect(bridge.prompts).toEqual(["web: first", "web: second"]);
+  });
+});
+
+describe("chat SSE frames", () => {
+  it("broadcasts deltas, then a final, all tagged with the turn id", async () => {
+    const hub = createSseHub();
+    const send = vi.fn();
+    hub.subscribe(send);
+    const bridge = fakeBridge(async (_p, onDelta) => {
+      onDelta("Hel");
+      onDelta("lo");
+      return { ok: true, text: "Hello", usage: 0.01 };
+    });
+    const { app } = makeChatApp(bridge, hub);
+
+    const { turnId } = (
+      await app.inject({ method: "POST", url: "/chat", payload: { text: "hi" } })
+    ).json();
+
+    await vi.waitFor(() => expect(send).toHaveBeenCalledTimes(3));
+    const frames = send.mock.calls as [string, Record<string, unknown>][];
+    expect(frames.map((f) => f[0])).toEqual(["chat", "chat", "chat"]);
+    expect(frames.map((f) => f[1])).toEqual([
+      { turnId, kind: "delta", text: "Hel" },
+      { turnId, kind: "delta", text: "lo" },
+      { turnId, kind: "final", text: "Hello" },
+    ]);
+  });
+
+  it("broadcasts an error frame when the turn fails", async () => {
+    const hub = createSseHub();
+    const send = vi.fn();
+    hub.subscribe(send);
+    const bridge = fakeBridge(async () => ({
+      ok: false,
+      text: "",
+      error: "claude exited with code 1",
+      usage: null,
+    }));
+    const { app } = makeChatApp(bridge, hub);
+
+    const { turnId } = (
+      await app.inject({ method: "POST", url: "/chat", payload: { text: "hi" } })
+    ).json();
+
+    await vi.waitFor(() => expect(send).toHaveBeenCalled());
+    const last = send.mock.calls.at(-1) as [string, Record<string, unknown>];
+    expect(last[0]).toBe("chat");
+    expect(last[1]).toEqual({
+      turnId,
+      kind: "error",
+      message: "claude exited with code 1",
+    });
+  });
+
+  it("broadcasts an error frame when the bridge itself throws", async () => {
+    const hub = createSseHub();
+    const send = vi.fn();
+    hub.subscribe(send);
+    const bridge = fakeBridge(async () => {
+      throw new Error("bridge exploded");
+    });
+    const { app } = makeChatApp(bridge, hub);
+
+    const res = await app.inject({ method: "POST", url: "/chat", payload: { text: "hi" } });
+    expect(res.statusCode).toBe(202);
+
+    await vi.waitFor(() => expect(send).toHaveBeenCalled());
+    const last = send.mock.calls.at(-1) as [string, { kind: string; message: string }];
+    expect(last[1].kind).toBe("error");
+    expect(last[1].message).toMatch(/bridge exploded/);
+  });
+
+  it("one broken subscriber cannot stop another from receiving chat frames", async () => {
+    const hub = createSseHub();
+    hub.subscribe(() => {
+      throw new Error("dead client");
+    });
+    const good = vi.fn();
+    hub.subscribe(good);
+    const { app } = makeChatApp(fakeBridge(), hub);
+
+    await app.inject({ method: "POST", url: "/chat", payload: { text: "hi" } });
+    await vi.waitFor(() => expect(good).toHaveBeenCalled());
+    expect(good.mock.calls.at(-1)?.[0]).toBe("chat");
+  });
+});
+
+describe("chat persistence", () => {
+  it("stores both sides of the exchange on the human_web channel", async () => {
+    const bridge = fakeBridge(async () => ({ ok: true, text: "pong", usage: null }));
+    const { app } = makeChatApp(bridge);
+
+    await app.inject({
+      method: "POST",
+      url: "/chat",
+      payload: { text: "ping", user: "Amirreza" },
+    });
+
+    await vi.waitFor(async () => {
+      const rows = (await app.inject({ method: "GET", url: "/chat/history" })).json();
+      expect(rows).toHaveLength(2);
+    });
+
+    const rows = (await app.inject({ method: "GET", url: "/chat/history" })).json() as Message[];
+    expect(rows[0]).toMatchObject({
+      from_agent: "Amirreza",
+      to_agent: "web-lead",
+      channel: "human_web",
+      body: "ping",
+    });
+    expect(rows[1]).toMatchObject({
+      from_agent: "web-lead",
+      to_agent: "Amirreza",
+      channel: "human_web",
+      body: "pong",
+    });
+    for (const row of rows) {
+      expect(typeof row.id).toBe("string");
+      expect(row.id.length).toBeGreaterThan(0);
+      expect(typeof row.ts).toBe("number");
+    }
+    expect(rows[0]!.id).not.toBe(rows[1]!.id);
+  });
+
+  it("redacts both sides before storage (R4)", async () => {
+    const secret = "sk-ant-abcdefghijklmnopqrstuvwxyz0123456789";
+    const bridge = fakeBridge(async () => ({
+      ok: true,
+      text: `I used ghp_${"a".repeat(30)} to authenticate`,
+      usage: null,
+    }));
+    const { app, db } = makeChatApp(bridge);
+
+    await app.inject({
+      method: "POST",
+      url: "/chat",
+      payload: { text: `here is my key ${secret}, use it` },
+    });
+
+    await vi.waitFor(() => {
+      expect(listMessages(db, {})).toHaveLength(2);
+    });
+
+    // Check the raw table, not just the API: the requirement is that the
+    // credential never lands in SQLite at all.
+    const bodies = listMessages(db, {}).map((m) => m.body).join("\n");
+    expect(bodies).not.toContain(secret);
+    expect(bodies).not.toContain(`ghp_${"a".repeat(30)}`);
+    expect(bodies).toContain("[REDACTED:anthropic-key]");
+    expect(bodies).toContain("[REDACTED:github-token]");
+    // The surrounding prose survives.
+    expect(bodies).toContain("here is my key");
+  });
+
+  it("stores the human turn even when the reply fails", async () => {
+    const bridge = fakeBridge(async () => ({
+      ok: false,
+      text: "",
+      error: "timed out",
+      usage: null,
+    }));
+    const { app } = makeChatApp(bridge);
+
+    await app.inject({ method: "POST", url: "/chat", payload: { text: "anyone there?" } });
+
+    await vi.waitFor(async () => {
+      const rows = (await app.inject({ method: "GET", url: "/chat/history" })).json();
+      expect(rows).toHaveLength(1);
+    });
+    const rows = (await app.inject({ method: "GET", url: "/chat/history" })).json() as Message[];
+    expect(rows[0]).toMatchObject({ from_agent: "web", body: "anyone there?" });
+  });
+
+  it("makes chat turns visible to /threads alongside agent messages", async () => {
+    const { app } = makeChatApp(fakeBridge());
+    await app.inject({ method: "POST", url: "/chat", payload: { text: "hi" } });
+    await vi.waitFor(async () => {
+      const rows = (await app.inject({ method: "GET", url: "/chat/history" })).json();
+      expect(rows).toHaveLength(2);
+    });
+
+    const threads = (await app.inject({ method: "GET", url: "/threads" })).json();
+    expect(Array.isArray(threads)).toBe(true);
+    expect(JSON.stringify(threads)).toContain("web-lead");
+  });
+});
+
+describe("GET /chat/history", () => {
+  it("returns [] when nothing has been said", async () => {
+    const { app } = makeChatApp(fakeBridge());
+    const res = await app.inject({ method: "GET", url: "/chat/history" });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual([]);
+  });
+
+  it("returns human_web messages oldest-first and excludes inter-agent traffic", async () => {
+    const { app, db } = makeChatApp(fakeBridge());
+    insertMessage(db, msg({ id: "agent-1", ts: 5, channel: "inter_agent" }));
+    insertMessage(db, {
+      id: "c2",
+      ts: 30,
+      from_agent: "web-lead",
+      to_agent: "web",
+      channel: "human_web",
+      body: "later",
+      session_id: null,
+    });
+    insertMessage(db, {
+      id: "c1",
+      ts: 20,
+      from_agent: "web",
+      to_agent: "web-lead",
+      channel: "human_web",
+      body: "earlier",
+      session_id: null,
+    });
+
+    const rows = (await app.inject({ method: "GET", url: "/chat/history" })).json() as Message[];
+    expect(rows.map((r) => r.id)).toEqual(["c1", "c2"]);
+  });
+
+  it("is available even with no bridge configured", async () => {
+    const { app, db } = makeChatApp();
+    insertMessage(db, {
+      id: "c1",
+      ts: 20,
+      from_agent: "web",
+      to_agent: "web-lead",
+      channel: "human_web",
+      body: "hi",
+      session_id: null,
+    });
+    const res = await app.inject({ method: "GET", url: "/chat/history" });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toHaveLength(1);
   });
 });
