@@ -61,9 +61,25 @@ function fakeApi(over: Partial<ApiClient> = {}): ApiClient {
     threads: vi.fn(async () => [thread]),
     events: vi.fn(async () => []),
     agentEntries: vi.fn(async () => [storedEntry()]),
+    sendChat: vi.fn(async () => ({ turnId: "turn-1" })),
+    chatHistory: vi.fn(async () => []),
     ...over,
   };
 }
+
+/** Captures the callback for one SSE channel so a test can emit frames. */
+function channelFactory(channel: string) {
+  const box: { emit?: (e: { data: string }) => void } = {};
+  const factory = () => ({
+    addEventListener(type: string, cb: (e: { data: string }) => void) {
+      if (type === channel) box.emit = cb;
+    },
+    close() {},
+  });
+  return { factory, box };
+}
+
+const chatToggle = () => screen.getByRole("button", { name: /^chat$/i });
 
 /** Never connects; App must still render from the REST snapshot. */
 const noLive = () => ({ addEventListener() {}, close() {} });
@@ -247,5 +263,242 @@ describe("App", () => {
       expect(screen.getByText("first chunk of output")).toBeInTheDocument(),
     );
     expect(screen.queryByText("someone else's output")).not.toBeInTheDocument();
+  });
+});
+
+describe("App chat drawer", () => {
+  it("offers the chat drawer from every view", async () => {
+    renderApp();
+    await screen.findByText("payments");
+
+    expect(chatToggle()).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("tab", { name: /pipeline/i }));
+    expect(chatToggle()).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("tab", { name: /conversations/i }));
+    expect(chatToggle()).toBeInTheDocument();
+  });
+
+  it("stays available inside an agent's detail view", async () => {
+    renderApp();
+    await userEvent.click(await screen.findByRole("button", { name: "payments" }));
+    await screen.findByText("first chunk of output");
+
+    expect(chatToggle()).toBeInTheDocument();
+  });
+
+  it("opens and closes the drawer", async () => {
+    renderApp();
+    await screen.findByText("payments");
+
+    expect(screen.queryByRole("log")).not.toBeInTheDocument();
+    await userEvent.click(chatToggle());
+    expect(screen.getByRole("log")).toBeInTheDocument();
+
+    await userEvent.click(chatToggle());
+    expect(screen.queryByRole("log")).not.toBeInTheDocument();
+  });
+
+  it("loads chat history on mount and shows it as completed turns", async () => {
+    const api = fakeApi({
+      chatHistory: vi.fn(async () => [
+        {
+          id: "t1:in",
+          ts: 1,
+          from_agent: "Amirreza",
+          to_agent: "web-lead",
+          channel: "human_web" as const,
+          body: "how is checkout?",
+          session_id: null,
+        },
+        {
+          id: "t1:out",
+          ts: 2,
+          from_agent: "web-lead",
+          to_agent: "Amirreza",
+          channel: "human_web" as const,
+          body: "spec is merged",
+          session_id: null,
+        },
+      ]),
+    });
+    renderApp(api);
+    await screen.findByText("payments");
+
+    await userEvent.click(chatToggle());
+
+    expect(await screen.findByText("how is checkout?")).toBeInTheDocument();
+    expect(screen.getByText("spec is merged")).toBeInTheDocument();
+    expect(screen.getByText("Amirreza")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("status", { name: /reply in progress/i }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("pairs history by turn id, not by position, so interleaved users don't cross", async () => {
+    // Two people share one lead. Even serialized, a failed turn (prompt with no
+    // reply) or any interleaving breaks strict-alternation pairing — Bob's
+    // prompt would be shown as the answer to Alice. Pairing by the turn id in
+    // the message id keeps each turn intact.
+    const api = fakeApi({
+      chatHistory: vi.fn(async () => [
+        { id: "tA:in", ts: 1, from_agent: "Alice", to_agent: "web-lead", channel: "human_web" as const, body: "alice asks", session_id: null },
+        { id: "tB:in", ts: 2, from_agent: "Bob", to_agent: "web-lead", channel: "human_web" as const, body: "bob asks", session_id: null },
+        { id: "tA:out", ts: 3, from_agent: "web-lead", to_agent: "Alice", channel: "human_web" as const, body: "answer for alice", session_id: null },
+        { id: "tB:out", ts: 4, from_agent: "web-lead", to_agent: "Bob", channel: "human_web" as const, body: "answer for bob", session_id: null },
+      ]),
+    });
+    renderApp(api);
+    await screen.findByText("payments");
+    await userEvent.click(chatToggle());
+
+    // Alice's turn shows Alice's prompt paired with Alice's answer — not Bob's.
+    const alicePrompt = await screen.findByText("alice asks");
+    const aliceTurn = alicePrompt.closest("li") ?? alicePrompt.parentElement!;
+    expect(aliceTurn).toHaveTextContent("answer for alice");
+    expect(aliceTurn).not.toHaveTextContent("bob asks");
+    expect(aliceTurn).not.toHaveTextContent("answer for bob");
+  });
+
+  it("keeps the dashboard usable when chat history fails to load", async () => {
+    const api = fakeApi({
+      chatHistory: vi.fn(async () => {
+        throw new ApiError("boom", 500);
+      }),
+    });
+    renderApp(api);
+
+    expect(await screen.findByText("payments")).toBeInTheDocument();
+    await userEvent.click(chatToggle());
+    expect(screen.getByRole("log")).toBeInTheDocument();
+  });
+
+  it("sends a message and shows it as a streaming turn", async () => {
+    const api = fakeApi();
+    renderApp(api);
+    await screen.findByText("payments");
+    await userEvent.click(chatToggle());
+
+    await userEvent.type(screen.getByRole("textbox"), "status please{Enter}");
+
+    expect(api.sendChat).toHaveBeenCalledWith("status please");
+    expect(await screen.findByText("status please")).toBeInTheDocument();
+    await waitFor(() =>
+      expect(
+        screen.getByRole("status", { name: /reply in progress/i }),
+      ).toBeInTheDocument(),
+    );
+  });
+
+  it("appends successive deltas to the reply in arrival order", async () => {
+    const { factory, box } = channelFactory("chat");
+    const api = fakeApi();
+    render(<App api={api} liveFactory={factory} now={2_000} />);
+    await screen.findByText("payments");
+    await userEvent.click(chatToggle());
+
+    await userEvent.type(screen.getByRole("textbox"), "hello{Enter}");
+    await waitFor(() => expect(api.sendChat).toHaveBeenCalled());
+
+    box.emit!({
+      data: JSON.stringify({ turnId: "turn-1", kind: "delta", text: "look" }),
+    });
+    box.emit!({
+      data: JSON.stringify({ turnId: "turn-1", kind: "delta", text: "ing at it" }),
+    });
+
+    await waitFor(() =>
+      expect(screen.getByText("looking at it")).toBeInTheDocument(),
+    );
+  });
+
+  it("replaces the reply and clears the indicator on a final frame", async () => {
+    const { factory, box } = channelFactory("chat");
+    const api = fakeApi();
+    render(<App api={api} liveFactory={factory} now={2_000} />);
+    await screen.findByText("payments");
+    await userEvent.click(chatToggle());
+
+    await userEvent.type(screen.getByRole("textbox"), "hello{Enter}");
+    await waitFor(() => expect(api.sendChat).toHaveBeenCalled());
+
+    box.emit!({
+      data: JSON.stringify({ turnId: "turn-1", kind: "delta", text: "par" }),
+    });
+    box.emit!({
+      data: JSON.stringify({
+        turnId: "turn-1",
+        kind: "final",
+        text: "the complete reply",
+      }),
+    });
+
+    await waitFor(() =>
+      expect(screen.getByText("the complete reply")).toBeInTheDocument(),
+    );
+    expect(screen.queryByText("par")).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("status", { name: /reply in progress/i }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("marks a turn as failed on an error frame", async () => {
+    const { factory, box } = channelFactory("chat");
+    const api = fakeApi();
+    render(<App api={api} liveFactory={factory} now={2_000} />);
+    await screen.findByText("payments");
+    await userEvent.click(chatToggle());
+
+    await userEvent.type(screen.getByRole("textbox"), "hello{Enter}");
+    await waitFor(() => expect(api.sendChat).toHaveBeenCalled());
+
+    box.emit!({
+      data: JSON.stringify({
+        turnId: "turn-1",
+        kind: "error",
+        message: "lead timed out",
+      }),
+    });
+
+    await waitFor(() =>
+      expect(screen.getByRole("alert")).toHaveTextContent("lead timed out"),
+    );
+  });
+
+  it("ignores a chat frame for an unknown turn instead of crashing", async () => {
+    const { factory, box } = channelFactory("chat");
+    const api = fakeApi();
+    render(<App api={api} liveFactory={factory} now={2_000} />);
+    await screen.findByText("payments");
+    await userEvent.click(chatToggle());
+
+    await userEvent.type(screen.getByRole("textbox"), "hello{Enter}");
+    await waitFor(() => expect(api.sendChat).toHaveBeenCalled());
+
+    box.emit!({
+      data: JSON.stringify({ turnId: "nope", kind: "delta", text: "stray" }),
+    });
+
+    await waitFor(() => expect(screen.getByText("hello")).toBeInTheDocument());
+    expect(screen.queryByText("stray")).not.toBeInTheDocument();
+  });
+
+  it("disables the composer with a reason when no lead is configured", async () => {
+    const api = fakeApi({
+      sendChat: vi.fn(async () => {
+        throw new ApiError("no lead", 503);
+      }),
+    });
+    renderApp(api);
+    await screen.findByText("payments");
+    await userEvent.click(chatToggle());
+
+    await userEvent.type(screen.getByRole("textbox"), "anyone home?{Enter}");
+
+    await waitFor(() => expect(screen.getByRole("textbox")).toBeDisabled());
+    expect(screen.getByText(/no lead/i)).toBeInTheDocument();
+    // The dashboard itself keeps working.
+    expect(screen.getByText("running tests")).toBeInTheDocument();
   });
 });

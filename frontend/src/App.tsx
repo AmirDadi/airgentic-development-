@@ -1,11 +1,50 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { createApi, type ApiClient } from "./api";
+import { ApiError, createApi, type ApiClient } from "./api";
 import { useLive, type EventSourceFactory } from "./useLive";
 import { TeamBoard } from "./components/TeamBoard";
 import { PipelineBoard } from "./components/PipelineBoard";
 import { Conversations } from "./components/Conversations";
 import { AgentDetail } from "./components/AgentDetail";
-import type { Agent, Feature, StoredEntry, Thread } from "./types";
+import { ChatDrawer, type ChatTurn } from "./components/ChatDrawer";
+import type { Agent, Feature, Message, StoredEntry, Thread } from "./types";
+
+/** Shown when the backend reports it has no web lead to talk to. */
+const NO_LEAD = "No lead agent is configured — chat is unavailable.";
+
+/** The turn id a stored chat message belongs to (its id is `<turnId>:in|out`). */
+function turnIdOf(m: Message): string {
+  return m.id.replace(/:(in|out)$/, "");
+}
+
+/**
+ * Stored `human_web` messages are a flat oldest-first list; the drawer wants
+ * prompt/reply pairs. Pairing is by TURN ID (the `<turnId>:in` / `:out` in the
+ * message id), not by position: several people share one lead, so a failed
+ * turn (prompt with no reply) or any interleaving would otherwise attribute one
+ * person's message to another. First-seen turn order is preserved.
+ */
+function turnsFromHistory(messages: Message[]): ChatTurn[] {
+  const byTurn = new Map<string, ChatTurn>();
+  const order: string[] = [];
+  for (const m of messages) {
+    const id = turnIdOf(m);
+    const isReply = m.id.endsWith(":out");
+    let turn = byTurn.get(id);
+    if (turn === undefined) {
+      turn = { id, user: m.from_agent, text: "", reply: "", status: "done" };
+      byTurn.set(id, turn);
+      order.push(id);
+    }
+    if (isReply) {
+      turn.reply = m.body;
+    } else {
+      // The prompt carries the human's name; the reply is from the lead.
+      turn.user = m.from_agent;
+      turn.text = m.body;
+    }
+  }
+  return order.map((id) => byTurn.get(id)!);
+}
 
 const TABS = [
   { id: "team", label: "Team" },
@@ -36,6 +75,14 @@ export default function App({ api, liveFactory, now }: AppProps = {}) {
   const [entries, setEntries] = useState<StoredEntry[]>([]);
   const [error, setError] = useState<string>();
 
+  const [chatOpen, setChatOpen] = useState(false);
+  const [turns, setTurns] = useState<ChatTurn[]>([]);
+  const [chatDisabled, setChatDisabled] = useState<string>();
+
+  // Ids for turns the backend never accepted, so they cannot collide with
+  // server-issued turn ids or with each other.
+  const localTurnId = useRef(0);
+
   // Read by the SSE handler, which must not be re-created (and re-subscribed)
   // every time the open agent changes.
   const selectedAgentRef = useRef(selectedAgent);
@@ -60,6 +107,27 @@ export default function App({ api, liveFactory, now }: AppProps = {}) {
         setError(undefined);
       } catch {
         if (!cancelled) setError("Backend unreachable — showing no data.");
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [client]);
+
+  // Chat history is loaded separately from the dashboard snapshot: the chat
+  // bridge is optional, and its absence must leave the rest of the page intact.
+  useEffect(() => {
+    let cancelled = false;
+
+    (async () => {
+      try {
+        const history = await client.chatHistory();
+        if (!cancelled) setTurns(turnsFromHistory(history));
+      } catch {
+        // The drawer still opens, just empty — a missing transcript is not a
+        // reason to blank the dashboard or block sending.
+        if (!cancelled) setTurns([]);
       }
     })();
 
@@ -105,7 +173,44 @@ export default function App({ api, liveFactory, now }: AppProps = {}) {
     if (type === "agents") setAgents(data as Agent[]);
     else if (type === "features") setFeatures(data as Feature[]);
     else if (type === "messages") setThreads(data as Thread[]);
-    else if (type === "entries") {
+    else if (type === "chat") {
+      const frame = data as {
+        turnId?: string;
+        kind?: string;
+        text?: string;
+        message?: string;
+      };
+      if (typeof frame.turnId !== "string") return;
+      const id = frame.turnId;
+
+      setTurns((prev) => {
+        // A frame for a turn we do not know about (another browser's turn, or
+        // one from before this page loaded) is ignored, never crashes.
+        if (!prev.some((t) => t.id === id)) return prev;
+
+        return prev.map((t) => {
+          if (t.id !== id) return t;
+          switch (frame.kind) {
+            case "delta":
+              // APPEND: deltas are fragments and arrive in order.
+              return { ...t, reply: t.reply + (frame.text ?? ""), status: "streaming" };
+            case "final":
+              // The final frame is the whole reply, so it replaces the
+              // accumulated fragments rather than extending them.
+              return { ...t, reply: frame.text ?? t.reply, status: "done" };
+            case "error":
+              return {
+                ...t,
+                status: "error",
+                error: frame.message ?? "The lead could not answer.",
+              };
+            default:
+              // An unrecognised kind is dropped, not applied.
+              return t;
+          }
+        });
+      });
+    } else if (type === "entries") {
       const frame = data as { agent?: string; entries?: StoredEntry[] };
       // Only the open agent's stream is applied; other agents' frames are noise
       // for this view.
@@ -129,6 +234,41 @@ export default function App({ api, liveFactory, now }: AppProps = {}) {
   }, []);
 
   const { connected } = useLive({ onEvent, factory: liveFactory });
+
+  const onSendChat = useCallback(
+    (text: string) => {
+      void (async () => {
+        try {
+          const { turnId } = await client.sendChat(text);
+          // The turn appears only once the backend has accepted it, so its id
+          // is the real one and later `chat` frames can find it.
+          setTurns((prev) => [
+            ...prev,
+            { id: turnId, user: "You", text, reply: "", status: "streaming" },
+          ]);
+        } catch (e) {
+          // 503 is "no lead configured" — a standing condition, so the
+          // composer closes rather than letting the next message vanish too.
+          if (e instanceof ApiError && e.status === 503) {
+            setChatDisabled(NO_LEAD);
+            return;
+          }
+          setTurns((prev) => [
+            ...prev,
+            {
+              id: `local-${(localTurnId.current += 1)}`,
+              user: "You",
+              text,
+              reply: "",
+              status: "error",
+              error: "Could not reach the chat bridge.",
+            },
+          ]);
+        }
+      })();
+    },
+    [client],
+  );
 
   const selected = selectedThreadId ?? threads[0]?.id;
   const openAgent = agents.find((a) => a.name === selectedAgent);
@@ -196,6 +336,17 @@ export default function App({ api, liveFactory, now }: AppProps = {}) {
           />
         )}
       </main>
+
+      {/* Outside the tab switch and the detail branch: PRD §3 requires the
+          drawer from every view. */}
+      <ChatDrawer
+        open={chatOpen}
+        turns={turns}
+        onSend={onSendChat}
+        onToggle={() => setChatOpen((o) => !o)}
+        disabled={chatDisabled !== undefined}
+        disabledReason={chatDisabled}
+      />
     </div>
   );
 }

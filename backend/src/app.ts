@@ -8,11 +8,14 @@ import {
   listMessages,
   listEntries,
   insertEvent,
+  insertMessage,
 } from "./db.js";
 import { groupIntoThreads } from "./threads.js";
 import type { Event } from "./types.js";
 import { createSseHub, type SseHub } from "./sse.js";
 import { redact } from "./redact.js";
+import type { Bridge } from "./chat/bridge.js";
+import { createTurnQueue } from "./chat/queue.js";
 import fastifyStatic from "@fastify/static";
 
 /**
@@ -45,7 +48,19 @@ export interface BuildAppOptions {
    * work at all. Omitted = API-only mode (what every test uses).
    */
   uiDir?: string;
+  /**
+   * The web-lead chat bridge. INJECTED, always: tests drive a fake and no
+   * `claude` process is ever spawned by the app itself. Omitted = chat is not
+   * configured, and `POST /chat` answers 503 while the rest of the dashboard
+   * runs normally.
+   */
+  chat?: Bridge;
 }
+
+/** Who the lead answers as, in stored chat messages. */
+export const WEB_LEAD = "web-lead";
+/** Speaker name used when the client does not send one. */
+const DEFAULT_CHAT_USER = "web";
 
 // ajv type coercion is switched off app-wide (see buildApp) so that a body
 // like `{type: 42}` is rejected rather than silently stringified. Query params
@@ -81,6 +96,7 @@ const API_PREFIXES = [
   "/threads",
   "/ingest",
   "/live",
+  "/chat",
 ] as const;
 
 function num(v: string | undefined): number | undefined {
@@ -121,6 +137,22 @@ interface IngestBody {
   agent?: string | null;
   type: string;
   payload?: unknown;
+}
+
+const chatBodySchema = {
+  type: "object",
+  required: ["text"],
+  properties: {
+    // minLength here rejects `""`; whitespace-only is checked in the handler,
+    // where the trimmed value is available.
+    text: { type: "string", minLength: 1 },
+    user: { type: "string", minLength: 1 },
+  },
+} as const;
+
+interface ChatBody {
+  text: string;
+  user?: string;
 }
 
 /**
@@ -199,6 +231,117 @@ export function buildApp(
       hub.broadcast("events", event);
 
       return reply.code(201).send(event);
+    },
+  );
+
+  /**
+   * The web chat's history: both sides of every human↔lead exchange,
+   * oldest-first. Served whether or not a bridge is configured — past
+   * conversation is readable even when the lead is down.
+   */
+  app.get("/chat/history", async () =>
+    listMessages(db, {}).filter((m) => m.channel === "human_web"),
+  );
+
+  // One queue per app: turns are serialised so two humans typing at once
+  // cannot interleave inside the lead's context (PRD R3).
+  const chatQueue = createTurnQueue();
+
+  /**
+   * Accepts one human turn. Returns 202 immediately with a turn id — the
+   * reply arrives over the SSE `chat` channel, tagged with that id, because a
+   * turn takes tens of seconds and must not hold an HTTP request open.
+   */
+  app.post<{ Body: ChatBody }>(
+    "/chat",
+    { schema: { body: chatBodySchema } },
+    async (req, reply) => {
+      const bridge = opts.chat;
+      if (bridge === undefined) {
+        // The dashboard is useful without a lead; say so plainly rather than
+        // failing as a 500 or pretending the message was accepted.
+        return reply
+          .code(503)
+          .send({ error: "chat bridge not configured" });
+      }
+
+      const text = req.body.text.trim();
+      if (text.length === 0) {
+        return reply.code(400).send({ error: "text must not be empty" });
+      }
+      const user = req.body.user?.trim() || DEFAULT_CHAT_USER;
+
+      const turnId = randomUUID();
+
+      // Name-tagged so the lead knows who is speaking; the raw text goes to
+      // the agent (redaction is a storage concern, not a delivery one).
+      const prompt = `${user}: ${text}`;
+
+      // Deliberately not awaited: the response is 202 and the work continues
+      // on the queue. Every failure path inside ends in a `chat` error frame.
+      void chatQueue.push(async () => {
+        // The human message is stored INSIDE the serialized turn, not in the
+        // handler: storing it in the handler let two overlapping users land as
+        // in,in,out,out in the DB, and the history pairing then crossed one
+        // person's prompt with another's reply. Serialized, each turn's two
+        // rows stay adjacent. Redacted first (PRD R4).
+        insertMessage(db, {
+          id: `${turnId}:in`,
+          ts: Date.now(),
+          from_agent: user,
+          to_agent: WEB_LEAD,
+          channel: "human_web",
+          body: redact(text),
+          session_id: null,
+        });
+
+        try {
+          // The reply is delivered in ONE redacted frame when the turn
+          // completes, not streamed token by token. Incrementally redacting a
+          // live stream is deceptively hard — a secret split across tokens, or
+          // a multi-line PEM key, has to be held until it is whole — and the
+          // per-turn delay is acceptable, so we buffer, redact once, and emit
+          // once. Nothing partial ever reaches a browser (PRD R4). The onDelta
+          // hook is required by the bridge but intentionally ignored.
+          const result = await bridge.runTurn(prompt, () => {});
+
+          if (!result.ok) {
+            hub.broadcast("chat", {
+              turnId,
+              kind: "error",
+              message: result.error ?? "turn failed",
+            });
+            return;
+          }
+
+          insertMessage(db, {
+            id: `${turnId}:out`,
+            ts: Date.now(),
+            from_agent: WEB_LEAD,
+            to_agent: user,
+            channel: "human_web",
+            body: redact(result.text),
+            session_id: null,
+          });
+          // The one reply frame: the whole redacted text, matching what was
+          // just stored.
+          hub.broadcast("chat", {
+            turnId,
+            kind: "final",
+            text: redact(result.text),
+          });
+        } catch (err) {
+          // A bridge that throws is a bug in the bridge, not a reason for the
+          // browser to wait forever on a turn that will never finish.
+          hub.broadcast("chat", {
+            turnId,
+            kind: "error",
+            message: err instanceof Error ? err.message : String(err),
+          });
+        }
+      });
+
+      return reply.code(202).send({ turnId });
     },
   );
 

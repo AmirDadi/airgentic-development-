@@ -12,7 +12,7 @@ export interface EventSourceLike {
 export type EventSourceFactory = (url: string) => EventSourceLike;
 
 /** Event names the backend broadcasts on the SSE channel. */
-const CHANNELS = ["agents", "features", "messages", "events", "entries"] as const;
+const CHANNELS = ["agents", "features", "messages", "events", "entries", "chat"] as const;
 
 export interface UseLiveOptions {
   onEvent: (type: string, data: unknown) => void;

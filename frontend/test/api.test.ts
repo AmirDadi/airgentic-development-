@@ -108,6 +108,86 @@ describe("createApi", () => {
     expect(f).toHaveBeenCalledWith("http://dash/agents", expect.anything());
   });
 
+  it("posts chat text and returns the turn id", async () => {
+    const f = fakeFetch({ turnId: "turn-1" }, { status: 202 });
+    const api = createApi({ baseUrl: "http://dash", fetch: f });
+
+    await expect(api.sendChat("ship it")).resolves.toEqual({ turnId: "turn-1" });
+    expect(f).toHaveBeenLastCalledWith(
+      "http://dash/chat",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ text: "ship it" }),
+      }),
+    );
+  });
+
+  it("includes the user in the chat body only when provided", async () => {
+    const f = fakeFetch({ turnId: "t2" }, { status: 202 });
+    const api = createApi({ baseUrl: "http://dash", fetch: f });
+
+    await api.sendChat("hi", "Amirreza");
+    expect(f).toHaveBeenLastCalledWith(
+      "http://dash/chat",
+      expect.objectContaining({
+        body: JSON.stringify({ text: "hi", user: "Amirreza" }),
+      }),
+    );
+  });
+
+  it("sends the chat body as JSON", async () => {
+    const f = fakeFetch({ turnId: "t3" }, { status: 202 });
+    await createApi({ baseUrl: "http://dash", fetch: f }).sendChat("hi");
+
+    const init = (f as unknown as { mock: { calls: unknown[][] } }).mock
+      .calls[0][1] as RequestInit;
+    const headers = init.headers as Record<string, string>;
+    expect(headers["content-type"]).toMatch(/application\/json/);
+  });
+
+  it("surfaces a chat rejection as ApiError carrying the status", async () => {
+    const f = fakeFetch({ error: "empty text" }, { ok: false, status: 400 });
+    await expect(
+      createApi({ fetch: f }).sendChat(""),
+    ).rejects.toMatchObject({ status: 400 });
+  });
+
+  it("surfaces a missing lead as ApiError carrying 503", async () => {
+    const f = fakeFetch({ error: "no lead" }, { ok: false, status: 503 });
+    const rejected = createApi({ fetch: f }).sendChat("hi");
+    await expect(rejected).rejects.toBeInstanceOf(ApiError);
+    await expect(createApi({ fetch: f }).sendChat("hi")).rejects.toMatchObject({
+      status: 503,
+    });
+  });
+
+  it("requests chat history from its own endpoint and returns it", async () => {
+    const message = {
+      id: "m1",
+      ts: 1,
+      from_agent: "Amirreza",
+      to_agent: "lead",
+      channel: "human_web",
+      body: "hi",
+      session_id: null,
+    };
+    const f = fakeFetch([message]);
+    const api = createApi({ baseUrl: "http://dash", fetch: f });
+
+    await expect(api.chatHistory()).resolves.toEqual([message]);
+    expect(f).toHaveBeenLastCalledWith(
+      "http://dash/chat/history",
+      expect.anything(),
+    );
+  });
+
+  it("surfaces a chat history failure as ApiError", async () => {
+    const f = fakeFetch({ error: "nope" }, { ok: false, status: 500 });
+    await expect(createApi({ fetch: f }).chatHistory()).rejects.toBeInstanceOf(
+      ApiError,
+    );
+  });
+
   it("throws ApiError carrying the status on a non-OK response", async () => {
     const f = fakeFetch({ error: "nope" }, { ok: false, status: 503 });
     const api = createApi({ fetch: f });
