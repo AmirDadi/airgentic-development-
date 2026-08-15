@@ -942,16 +942,15 @@ describe("POST /chat", () => {
 });
 
 describe("chat SSE frames", () => {
-  it("streams safe deltas as whitespace commits them, then a final", async () => {
+  it("emits one redacted final frame when the turn completes", async () => {
     const hub = createSseHub();
     const send = vi.fn();
     hub.subscribe(send);
-    // A trailing space after each word lets the incremental redactor commit it.
-    const bridge = fakeBridge(async (_p, onDelta) => {
-      onDelta("the build ");
-      onDelta("is green ");
-      return { ok: true, text: "the build is green", usage: 0.01 };
-    });
+    const bridge = fakeBridge(async () => ({
+      ok: true,
+      text: "the build is green",
+      usage: 0.01,
+    }));
     const { app } = makeChatApp(bridge, hub);
 
     const { turnId } = (
@@ -968,30 +967,23 @@ describe("chat SSE frames", () => {
     );
     expect(send.mock.calls.every((c) => c[0] === "chat")).toBe(true);
     expect(frames.every((f) => f.turnId === turnId)).toBe(true);
-    // It streamed incrementally rather than dumping everything on `final`.
-    const deltas = frames
-      .filter((f) => f.kind === "delta")
-      .map((f) => f.text)
-      .join("");
-    expect(deltas.length).toBeGreaterThan(0);
+    // The reply is delivered in one frame, not streamed token by token.
+    expect(frames.filter((f) => f.kind === "delta")).toHaveLength(0);
     expect(frames.find((f) => f.kind === "final")?.text).toBe("the build is green");
   });
 
-  it("never broadcasts a secret split across deltas (R4 over the live stream)", async () => {
-    // Regression: delta and final frames were broadcast raw while only storage
-    // was redacted, so a planted key streamed to every browser verbatim.
+  it("never broadcasts a secret from the agent's reply (R4 over the live stream)", async () => {
+    // Regression: the reply frame once carried result.text raw while only
+    // storage was redacted, so a planted key reached every browser verbatim.
     const hub = createSseHub();
     const send = vi.fn();
     hub.subscribe(send);
     const KEY = "sk-ant-api03-FAKEfake0000FAKEfake1111FAKEfake2222AA";
-    const bridge = fakeBridge(async (_p, onDelta) => {
-      // The key arrives one fragment at a time — no single delta contains it.
-      onDelta("token ");
-      onDelta("sk-ant-");
-      onDelta("api03-FAKEfake0000FAKEfake1111FAKEfake2222AA");
-      onDelta(" end");
-      return { ok: true, text: `token ${KEY} end`, usage: null };
-    });
+    const bridge = fakeBridge(async () => ({
+      ok: true,
+      text: `here is the key ${KEY} guard it`,
+      usage: null,
+    }));
     const { app } = makeChatApp(bridge, hub);
 
     await app.inject({ method: "POST", url: "/chat", payload: { text: "leak?" } });

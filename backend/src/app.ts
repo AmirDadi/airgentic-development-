@@ -16,7 +16,6 @@ import { createSseHub, type SseHub } from "./sse.js";
 import { redact } from "./redact.js";
 import type { Bridge } from "./chat/bridge.js";
 import { createTurnQueue } from "./chat/queue.js";
-import { createStreamRedactor } from "./chat/stream-redactor.js";
 import fastifyStatic from "@fastify/static";
 
 /**
@@ -296,18 +295,15 @@ export function buildApp(
           session_id: null,
         });
 
-        // The delta frames go to browsers before the reply is complete, so a
-        // secret split across deltas would reach the DOM raw. Redact the
-        // stream incrementally — never emitting a fragment that could still be
-        // part of a secret (PRD R4). Storage is redacted separately below.
-        const streamRedactor = createStreamRedactor();
         try {
-          const result = await bridge.runTurn(prompt, (delta) => {
-            const safe = streamRedactor.push(delta);
-            if (safe.length > 0) {
-              hub.broadcast("chat", { turnId, kind: "delta", text: safe });
-            }
-          });
+          // The reply is delivered in ONE redacted frame when the turn
+          // completes, not streamed token by token. Incrementally redacting a
+          // live stream is deceptively hard — a secret split across tokens, or
+          // a multi-line PEM key, has to be held until it is whole — and the
+          // per-turn delay is acceptable, so we buffer, redact once, and emit
+          // once. Nothing partial ever reaches a browser (PRD R4). The onDelta
+          // hook is required by the bridge but intentionally ignored.
+          const result = await bridge.runTurn(prompt, () => {});
 
           if (!result.ok) {
             hub.broadcast("chat", {
@@ -327,9 +323,8 @@ export function buildApp(
             body: redact(result.text),
             session_id: null,
           });
-          // The final frame REPLACES the streamed reply in the UI, so it
-          // carries the whole redacted text. Previously it sent result.text
-          // raw — the R4 leak this closes.
+          // The one reply frame: the whole redacted text, matching what was
+          // just stored.
           hub.broadcast("chat", {
             turnId,
             kind: "final",
