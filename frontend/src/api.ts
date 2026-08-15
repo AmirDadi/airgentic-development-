@@ -92,7 +92,32 @@ export interface StopAccepted {
   ts: number;
 }
 
+/**
+ * What the server will say about auth, without leaking anything beyond it.
+ * `authRequired` is false for deployments with no `DASHBOARD_TOKEN` set, which
+ * is the existing default. The session cookie is httpOnly, so this endpoint —
+ * not `document.cookie` — is the only way the UI can learn it is signed in.
+ */
+export interface AuthStatus {
+  authRequired: boolean;
+  authenticated: boolean;
+}
+
+/** The bodies `/auth/login` and `/auth/logout` answer with on success. */
+export interface AuthOk {
+  ok: true;
+}
+
 export interface ApiClient {
+  /** Reachable without credentials — it is how the UI decides to gate. */
+  authStatus(): Promise<AuthStatus>;
+  /**
+   * Exchanges the shared token for an httpOnly session cookie. Rejects with
+   * 401 for a wrong token; the caller reads `status`, not the message.
+   */
+  login(token: string): Promise<AuthOk>;
+  /** Clears the session cookie server-side. */
+  logout(): Promise<AuthOk>;
   agents(): Promise<Agent[]>;
   features(): Promise<Feature[]>;
   threads(): Promise<unknown[]>;
@@ -118,6 +143,11 @@ export function createApi(opts: ApiOptions = {}): ApiClient {
   const cfg = { baseUrl, fetch: f };
 
   return {
+    authStatus: () => get<AuthStatus>("/auth/status", cfg),
+    login: (token: string) => post<AuthOk>("/auth/login", { token }, cfg),
+    // No body of its own: the session to end is named by the cookie, which the
+    // browser attaches and JS cannot read.
+    logout: () => post<AuthOk>("/auth/logout", {}, cfg),
     agents: () => get<Agent[]>("/agents", cfg),
     features: () => get<Feature[]>("/features", cfg),
     threads: () => get<unknown[]>("/threads", cfg),

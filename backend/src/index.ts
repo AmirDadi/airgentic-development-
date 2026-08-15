@@ -16,6 +16,19 @@
  *                       window). OFF by default: Stop writes into an agent's
  *                       runtime, so a deployment must opt in. Unset = 503, and
  *                       it MUST sit behind the deployment's own access control.
+ *   DASHBOARD_TOKEN     Shared secret for app-layer auth. UNSET = auth is
+ *                       disabled and every endpoint is open, exactly as before
+ *                       (the server warns, and warns harder when ENABLE_STOP
+ *                       is on: an open Stop endpoint lets anyone interrupt the
+ *                       team's agents). Set = everything needs a credential
+ *                       except GET /health, POST /auth/login, GET /auth/status
+ *                       and the static UI assets. Clients log in at
+ *                       POST /auth/login {token} and get an httpOnly cookie
+ *                       holding a random session id; hooks and curl may send
+ *                       `Authorization: Bearer <token>` instead. Sessions are
+ *                       IN MEMORY, so a restart logs everyone out. Over plain
+ *                       HTTP the token still travels in the clear: this is a
+ *                       lock on the door, not a replacement for TLS/Tailscale.
  *   SPECS_DIR           Directory scanned for `<feature>.{spec,interfaces,plan}.md`.
  *                       Default "specs".
  *   TRANSCRIPT_SOURCES  JSON array of {agent, path, sessionId} transcripts to
@@ -114,14 +127,46 @@ const chat =
 
 const tmuxSession = process.env.TMUX_SESSION ?? "agents";
 // Stop is a write into an agent's runtime, so it is opt-in: off unless
-// ENABLE_STOP is explicitly set. It still must sit behind the deployment's
-// access control (there is no app-layer auth — see PRD Q2).
+// ENABLE_STOP is explicitly set. DASHBOARD_TOKEN now puts an app-layer lock in
+// front of it, but that is not a substitute for the deployment's own access
+// control: over plain HTTP the token travels in the clear.
 const stopEnabled = /^(1|true|yes|on)$/i.test(process.env.ENABLE_STOP ?? "");
 const stop = stopEnabled
   ? { session: tmuxSession, runner: defaultRunner }
   : undefined;
 
-const app = buildApp(db, { hub, logger: true, uiDir, chat, stop });
+// A blank or whitespace-only token is treated as unset: it would otherwise
+// configure a guard whose secret is "" — worse than no guard, because it looks
+// like one. `auth` is left undefined so buildApp registers no hook at all.
+const dashboardToken = process.env.DASHBOARD_TOKEN?.trim();
+const auth =
+  dashboardToken === undefined || dashboardToken === ""
+    ? undefined
+    : { token: dashboardToken };
+
+const app = buildApp(db, { hub, logger: true, uiDir, chat, stop, auth });
+if (auth === undefined) {
+  if (stop !== undefined) {
+    // The dangerous combination: an open write path into running agents.
+    app.log.error(
+      "SECURITY: no DASHBOARD_TOKEN and ENABLE_STOP is on — the dashboard is " +
+        "unauthenticated AND anyone who can reach it can interrupt your " +
+        "agents (POST /agents/:name/stop). Set DASHBOARD_TOKEN, or keep this " +
+        "server off any reachable network.",
+    );
+  } else {
+    app.log.warn(
+      "no DASHBOARD_TOKEN; the dashboard is unauthenticated — every endpoint " +
+        "is open to anyone who can reach this port. Set DASHBOARD_TOKEN to " +
+        "require a login.",
+    );
+  }
+} else {
+  app.log.info(
+    "DASHBOARD_TOKEN set; auth required (sessions are in memory, so a " +
+      "restart logs everyone out).",
+  );
+}
 if (stop === undefined) {
   app.log.info("ENABLE_STOP not set; Stop disabled (POST /agents/:name/stop -> 503).");
 } else {

@@ -6,10 +6,26 @@ import { PipelineBoard } from "./components/PipelineBoard";
 import { Conversations } from "./components/Conversations";
 import { AgentDetail } from "./components/AgentDetail";
 import { ChatDrawer, type ChatTurn } from "./components/ChatDrawer";
+import { LoginGate } from "./components/LoginGate";
 import type { Agent, Feature, Message, StoredEntry, Thread } from "./types";
 
 /** Shown when the backend reports it has no web lead to talk to. */
 const NO_LEAD = "No lead agent is configured — chat is unavailable.";
+
+/** The one thing the UI may say about a rejected token — it knows nothing more. */
+const BAD_TOKEN = "That token was not accepted.";
+
+/**
+ * `checking` is the moment before `/auth/status` answers: the shell renders,
+ * but NOTHING is fetched yet, so a gated dashboard never fires a burst of
+ * requests that would all 401. `locked` replaces the whole page with the gate.
+ */
+type AuthState = "checking" | "locked" | "open";
+
+/** The one status that means "log in again", from any endpoint. */
+function isAuthFailure(e: unknown): boolean {
+  return e instanceof ApiError && e.status === 401;
+}
 
 /** The turn id a stored chat message belongs to (its id is `<turnId>:in|out`). */
 function turnIdOf(m: Message): string {
@@ -85,6 +101,11 @@ export default function App({ api, liveFactory, now }: AppProps = {}) {
   const [stopping, setStopping] = useState<ReadonlySet<string>>(new Set());
   const [stopDisabled, setStopDisabled] = useState<string>();
 
+  const [authState, setAuthState] = useState<AuthState>("checking");
+  const [authRequired, setAuthRequired] = useState(false);
+  const [loginError, setLoginError] = useState<string>();
+  const [loggingIn, setLoggingIn] = useState(false);
+
   // Ids for turns the backend never accepted, so they cannot collide with
   // server-issued turn ids or with each other.
   const localTurnId = useRef(0);
@@ -94,9 +115,65 @@ export default function App({ api, liveFactory, now }: AppProps = {}) {
   const selectedAgentRef = useRef(selectedAgent);
   selectedAgentRef.current = selectedAgent;
 
+  /**
+   * Asks the server where we stand. The session cookie is httpOnly, so this is
+   * the ONLY way the page can learn whether it is signed in — there is nothing
+   * in `document.cookie` to read.
+   */
+  const readAuthStatus = useCallback(async (): Promise<AuthState> => {
+    // A client built before auth existed (or a lean test fake) may not have
+    // the method at all. Such a deployment cannot be gated, so it is open.
+    if (typeof client.authStatus !== "function") {
+      setAuthRequired(false);
+      return "open";
+    }
+    try {
+      const status = await client.authStatus();
+      setAuthRequired(status.authRequired === true);
+      return status.authRequired && !status.authenticated ? "locked" : "open";
+    } catch {
+      // `/auth/status` needs no credentials, so a failure here is the backend
+      // being down, not a rejection. Opening lets the dashboard fetches report
+      // "unreachable" instead of demanding a token nobody can validate.
+      setAuthRequired(false);
+      return "open";
+    }
+  }, [client]);
+
+  /**
+   * A 401 from an ordinary call means the session ended under us — sessions
+   * live in the server's memory, so a restart logs everyone out mid-page.
+   * Showing the gate is the honest answer; an empty dashboard or an
+   * "unreachable" banner would each send the user hunting the wrong problem.
+   */
+  const lockOut = useCallback(() => {
+    setAuthRequired(true);
+    setAuthState("locked");
+    setError(undefined);
+    setLoginError(undefined);
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    void (async () => {
+      const next = await readAuthStatus();
+      if (!cancelled) setAuthState(next);
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [readAuthStatus]);
+
   // Initial snapshot over REST. The SSE channel only carries deltas, so
   // without this the board would stay empty until something changed.
   useEffect(() => {
+    // Nothing is requested until auth is settled: while gated, every one of
+    // these would 401, and firing them would leak requests the caller is not
+    // allowed to make.
+    if (authState !== "open") return;
+
     let cancelled = false;
 
     (async () => {
@@ -111,36 +188,48 @@ export default function App({ api, liveFactory, now }: AppProps = {}) {
         setFeatures(f);
         setThreads(t);
         setError(undefined);
-      } catch {
-        if (!cancelled) setError("Backend unreachable — showing no data.");
+      } catch (e) {
+        if (cancelled) return;
+        if (isAuthFailure(e)) {
+          lockOut();
+          return;
+        }
+        setError("Backend unreachable — showing no data.");
       }
     })();
 
     return () => {
       cancelled = true;
     };
-  }, [client]);
+  }, [client, authState, lockOut]);
 
   // Chat history is loaded separately from the dashboard snapshot: the chat
   // bridge is optional, and its absence must leave the rest of the page intact.
   useEffect(() => {
+    if (authState !== "open") return;
+
     let cancelled = false;
 
     (async () => {
       try {
         const history = await client.chatHistory();
         if (!cancelled) setTurns(turnsFromHistory(history));
-      } catch {
+      } catch (e) {
+        if (cancelled) return;
+        if (isAuthFailure(e)) {
+          lockOut();
+          return;
+        }
         // The drawer still opens, just empty — a missing transcript is not a
         // reason to blank the dashboard or block sending.
-        if (!cancelled) setTurns([]);
+        setTurns([]);
       }
     })();
 
     return () => {
       cancelled = true;
     };
-  }, [client]);
+  }, [client, authState, lockOut]);
 
   // Snapshot of the open agent's transcript. Live `entries` frames then keep
   // it current without a refetch.
@@ -165,15 +254,20 @@ export default function App({ api, liveFactory, now }: AppProps = {}) {
           const newer = prev.filter((e) => !snapshotIds.has(e.id));
           return [...snapshot, ...newer];
         });
-      } catch {
-        if (!cancelled) setEntries([]);
+      } catch (e) {
+        if (cancelled) return;
+        if (isAuthFailure(e)) {
+          lockOut();
+          return;
+        }
+        setEntries([]);
       }
     })();
 
     return () => {
       cancelled = true;
     };
-  }, [client, selectedAgent]);
+  }, [client, selectedAgent, lockOut]);
 
   const onEvent = useCallback((type: string, data: unknown) => {
     if (type === "agents") setAgents(data as Agent[]);
@@ -239,7 +333,58 @@ export default function App({ api, liveFactory, now }: AppProps = {}) {
     }
   }, []);
 
-  const { connected } = useLive({ onEvent, factory: liveFactory });
+  // No SSE while gated: an EventSource aimed at a 401 reconnects forever.
+  const { connected } = useLive({
+    onEvent,
+    factory: liveFactory,
+    enabled: authState === "open",
+  });
+
+  const onLogin = useCallback(
+    (token: string) => {
+      setLoggingIn(true);
+      setLoginError(undefined);
+      void (async () => {
+        try {
+          await client.login(token);
+          // The cookie is httpOnly, so "did it work?" can only be answered by
+          // asking again rather than by inspecting anything locally.
+          setAuthState(await readAuthStatus());
+        } catch (e) {
+          setLoginError(
+            isAuthFailure(e)
+              ? BAD_TOKEN
+              : "Could not reach the server to sign in — please try again.",
+          );
+        } finally {
+          setLoggingIn(false);
+        }
+      })();
+    },
+    [client, readAuthStatus],
+  );
+
+  const onLogout = useCallback(() => {
+    void (async () => {
+      try {
+        await client.logout();
+      } catch {
+        // Whether or not the server confirmed, this browser is done with the
+        // session — returning to the gate is right either way.
+      }
+      // Dropped rather than left on screen behind the gate.
+      setAgents([]);
+      setFeatures([]);
+      setThreads([]);
+      setEntries([]);
+      setTurns([]);
+      setSelectedAgent(undefined);
+      setChatOpen(false);
+      setAuthState("locked");
+      setAuthRequired(true);
+      setError(undefined);
+    })();
+  }, [client]);
 
   const onSendChat = useCallback(
     (text: string) => {
@@ -253,6 +398,10 @@ export default function App({ api, liveFactory, now }: AppProps = {}) {
             { id: turnId, user: "You", text, reply: "", status: "streaming" },
           ]);
         } catch (e) {
+          if (isAuthFailure(e)) {
+            lockOut();
+            return;
+          }
           // 503 is "no lead configured" — a standing condition, so the
           // composer closes rather than letting the next message vanish too.
           if (e instanceof ApiError && e.status === 503) {
@@ -273,7 +422,7 @@ export default function App({ api, liveFactory, now }: AppProps = {}) {
         }
       })();
     },
-    [client],
+    [client, lockOut],
   );
 
   // The dashboard never stops an agent on its own — this fires only from a
@@ -289,7 +438,9 @@ export default function App({ api, liveFactory, now }: AppProps = {}) {
         try {
           await client.stopAgent(name);
         } catch (e) {
-          if (e instanceof ApiError && e.status === 503) {
+          if (isAuthFailure(e)) {
+            lockOut();
+          } else if (e instanceof ApiError && e.status === 503) {
             setStopDisabled("Stop is not configured on this server.");
           } else {
             setError("Could not stop the agent — please try again.");
@@ -303,8 +454,14 @@ export default function App({ api, liveFactory, now }: AppProps = {}) {
         }
       })();
     },
-    [client],
+    [client, lockOut],
   );
+
+  // The whole page, replaced: nothing behind the gate renders, and no
+  // dashboard request has been issued for the server to reject.
+  if (authState === "locked") {
+    return <LoginGate onSubmit={onLogin} error={loginError} busy={loggingIn} />;
+  }
 
   const selected = selectedThreadId ?? threads[0]?.id;
   const openAgent = agents.find((a) => a.name === selectedAgent);
@@ -314,13 +471,26 @@ export default function App({ api, liveFactory, now }: AppProps = {}) {
       <header className="border-b border-slate-200 bg-white px-4 py-3">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <h1 className="text-lg font-semibold">Agent Team Dashboard</h1>
-          <span
+          <div className="flex items-center gap-3">
+            {/* Only meaningful where there is a session to end; with no token
+                configured there is nothing to log out of. */}
+            {authRequired && (
+              <button
+                type="button"
+                onClick={onLogout}
+                className="rounded border border-slate-300 bg-white px-2 py-1 text-xs text-slate-700 hover:bg-slate-100"
+              >
+                Log out
+              </button>
+            )}
+            <span
             className="text-xs text-slate-500"
             role="status"
             aria-label={connected ? "live updates connected" : "live updates disconnected"}
           >
-            {connected ? "● live" : "○ offline"}
-          </span>
+              {connected ? "● live" : "○ offline"}
+            </span>
+          </div>
         </div>
 
         <div role="tablist" aria-label="Views" className="mt-3 flex gap-1">
