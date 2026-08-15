@@ -248,6 +248,62 @@ describe("createApi", () => {
     );
   });
 
+  it("reads auth status from its own endpoint and returns both flags", async () => {
+    const f = fakeFetch({ authRequired: true, authenticated: false });
+    const api = createApi({ baseUrl: "http://dash", fetch: f });
+
+    await expect(api.authStatus()).resolves.toEqual({
+      authRequired: true,
+      authenticated: false,
+    });
+    expect(f).toHaveBeenLastCalledWith("http://dash/auth/status", expect.anything());
+  });
+
+  it("posts the token to the login endpoint", async () => {
+    const f = fakeFetch({ ok: true });
+    const api = createApi({ baseUrl: "http://dash", fetch: f });
+
+    await expect(api.login("s3cret")).resolves.toEqual({ ok: true });
+    expect(f).toHaveBeenLastCalledWith(
+      "http://dash/auth/login",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ token: "s3cret" }),
+      }),
+    );
+  });
+
+  it("surfaces a rejected token as ApiError carrying 401", async () => {
+    const f = fakeFetch({ error: "bad token" }, { ok: false, status: 401 });
+
+    await expect(createApi({ fetch: f }).login("wrong")).rejects.toBeInstanceOf(
+      ApiError,
+    );
+    await expect(createApi({ fetch: f }).login("wrong")).rejects.toMatchObject({
+      status: 401,
+    });
+  });
+
+  it("posts to the logout endpoint with an empty body", async () => {
+    const f = fakeFetch({ ok: true });
+    const api = createApi({ baseUrl: "http://dash", fetch: f });
+
+    await expect(api.logout()).resolves.toEqual({ ok: true });
+    expect(f).toHaveBeenLastCalledWith(
+      "http://dash/auth/logout",
+      expect.objectContaining({ method: "POST", body: JSON.stringify({}) }),
+    );
+  });
+
+  it("surfaces a 401 from any ordinary endpoint as ApiError carrying 401", async () => {
+    // The gate keys off this status, so it must survive the client intact.
+    const f = fakeFetch({ error: "unauthorized" }, { ok: false, status: 401 });
+
+    await expect(createApi({ fetch: f }).agents()).rejects.toMatchObject({
+      status: 401,
+    });
+  });
+
   it("throws ApiError carrying the status on a non-OK response", async () => {
     const f = fakeFetch({ error: "nope" }, { ok: false, status: 503 });
     const api = createApi({ fetch: f });

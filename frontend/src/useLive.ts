@@ -18,6 +18,12 @@ export interface UseLiveOptions {
   onEvent: (type: string, data: unknown) => void;
   url?: string;
   factory?: EventSourceFactory;
+  /**
+   * Defaults to true. Set false while the UI is gated behind a login: an
+   * EventSource pointed at a 401 reconnects forever, so an unauthenticated
+   * page would hammer the endpoint it is not allowed to read.
+   */
+  enabled?: boolean;
 }
 
 /**
@@ -26,7 +32,7 @@ export interface UseLiveOptions {
  * subscription").
  */
 export function useLive(opts: UseLiveOptions): { connected: boolean } {
-  const { url = "/live", factory } = opts;
+  const { url = "/live", factory, enabled = true } = opts;
   const [connected, setConnected] = useState(false);
 
   // Kept in a ref so a changing callback identity never tears down and
@@ -37,6 +43,11 @@ export function useLive(opts: UseLiveOptions): { connected: boolean } {
   const factoryRef = useRef(factory);
 
   useEffect(() => {
+    if (!enabled) {
+      setConnected(false);
+      return;
+    }
+
     const create = factoryRef.current;
 
     // No injected factory and no EventSource in this environment (jsdom, SSR,
@@ -65,7 +76,7 @@ export function useLive(opts: UseLiveOptions): { connected: boolean } {
     }
 
     return () => source.close();
-  }, [url]);
+  }, [url, enabled]);
 
   return { connected };
 }

@@ -18,6 +18,13 @@ import type { Bridge } from "./chat/bridge.js";
 import { createTurnQueue } from "./chat/queue.js";
 import { stopAgent } from "./stop.js";
 import type { CommandRunner } from "./collectors/liveness.js";
+import {
+  createSessionStore,
+  parseCookies,
+  serializeCookie,
+  tokensMatch,
+  DEFAULT_SESSION_TTL_MS,
+} from "./auth.js";
 import fastifyStatic from "@fastify/static";
 
 /**
@@ -71,6 +78,19 @@ export interface BuildAppOptions {
     /** Executor for the interrupt command; `shell:false` under the hood. */
     runner: CommandRunner;
   };
+  /**
+   * The shared dashboard token. INJECTED, always: `index.ts` supplies it from
+   * `DASHBOARD_TOKEN`, tests supply their own.
+   *
+   * OMITTED = NO GUARD IS REGISTERED AT ALL and the app behaves exactly as it
+   * did before auth existed. That is the whole reason auth is an option rather
+   * than a mode flag: "disabled" is the absence of the hook, not a branch
+   * inside it that could be got wrong.
+   */
+  auth?: {
+    /** Compared timing-safely against a presented token. */
+    token: string;
+  };
 }
 
 /** Who the lead answers as, in stored chat messages. */
@@ -113,7 +133,64 @@ const API_PREFIXES = [
   "/ingest",
   "/live",
   "/chat",
+  // Without this the SPA fallback would answer GET /auth/... with index.html,
+  // and the login flow would be shadowed by the page that needs it.
+  "/auth",
 ] as const;
+
+/** The path half of a request URL, with the query string dropped. */
+function pathOf(url: string): string {
+  return url.split("?")[0] ?? "";
+}
+
+/**
+ * True when a path belongs to the API rather than to the static UI.
+ *
+ * Checked against BOTH the raw and the percent-decoded path: the auth guard
+ * exempts static assets by "not an API path", so `/%61gents` matching a route
+ * but not this test would be an exemption that hands out `/agents` unguarded.
+ */
+function isApiPath(path: string): boolean {
+  const candidates = [path];
+  try {
+    const decoded = decodeURIComponent(path);
+    if (decoded !== path) candidates.push(decoded);
+  } catch {
+    // Malformed encoding: the raw form is all we have, and it will not route.
+  }
+  return candidates.some((c) =>
+    API_PREFIXES.some((p) => c === p || c.startsWith(`${p}/`)),
+  );
+}
+
+/** Cookie carrying the session id — never the token itself. */
+const SESSION_COOKIE = "dash_session";
+
+/**
+ * Requests that must work with no credential when a token IS configured:
+ *
+ *   GET  /health       — liveness probes run before anyone logs in.
+ *   GET  /auth/status  — the UI has to learn that it must show a login form.
+ *   POST /auth/login   — the only way to obtain a credential.
+ *   POST /auth/logout  — clearing a dead session must never itself 401.
+ *
+ * Plus, when a UI directory is served, any GET/HEAD that is NOT an API path:
+ * the login page and its bundle must load. The bundle is not secret; the data
+ * behind it is, and every API path stays guarded by the `isApiPath` test.
+ */
+function isExemptFromAuth(
+  method: string,
+  path: string,
+  servesUi: boolean,
+): boolean {
+  const isRead = method === "GET" || method === "HEAD";
+  if (isRead && path === "/health") return true;
+  if (isRead && path === "/auth/status") return true;
+  if (method === "POST" && (path === "/auth/login" || path === "/auth/logout")) {
+    return true;
+  }
+  return isRead && servesUi && !isApiPath(path);
+}
 
 function num(v: string | undefined): number | undefined {
   return v === undefined ? undefined : Number(v);
@@ -198,6 +275,107 @@ export function buildApp(
     ajv: { customOptions: { coerceTypes: false } },
   });
   const hub = opts.hub ?? createSseHub();
+
+  // ---- auth (PRD Q2) -------------------------------------------------------
+  // Sessions are per-app and in memory: a restart logs everyone out, which is
+  // the accepted trade for having no session store at all.
+  const auth = opts.auth;
+  const sessions = createSessionStore();
+
+  /** The bearer token presented, if the header is a well-formed non-empty one. */
+  function bearerOf(header: string | undefined): string | undefined {
+    if (typeof header !== "string") return undefined;
+    const match = /^Bearer[ \t]+(\S.*)$/.exec(header.trim());
+    return match?.[1];
+  }
+
+  function sessionIdOf(cookieHeader: string | undefined): string | undefined {
+    return parseCookies(cookieHeader)[SESSION_COOKIE];
+  }
+
+  /**
+   * Either credential authenticates: the cookie (which `EventSource` sends
+   * automatically, and which is the only thing that can guard `GET /live`), or
+   * `Authorization: Bearer` (for the shell hooks that POST to `/ingest` and
+   * cannot hold a cookie jar).
+   */
+  function isAuthenticated(req: {
+    headers: { cookie?: string; authorization?: string };
+  }): boolean {
+    if (auth === undefined) return false;
+    if (sessions.verify(sessionIdOf(req.headers.cookie))) return true;
+    const bearer = bearerOf(req.headers.authorization);
+    return bearer !== undefined && tokensMatch(bearer, auth.token);
+  }
+
+  if (auth !== undefined) {
+    const servesUi = opts.uiDir !== undefined;
+    app.addHook("onRequest", async (req, reply) => {
+      if (isExemptFromAuth(req.method, pathOf(req.url), servesUi)) return;
+      if (isAuthenticated(req)) return;
+      // 401 + JSON, never a redirect: the clients are `fetch` and
+      // `EventSource`, which would follow a redirect into a parse failure
+      // instead of surfacing "you need to log in".
+      return reply.code(401).send({ error: "authentication required" });
+    });
+  }
+
+  const loginBodySchema = {
+    type: "object",
+    required: ["token"],
+    properties: { token: { type: "string", minLength: 1 } },
+    additionalProperties: false,
+  } as const;
+
+  /**
+   * Exchanges the shared token for a session cookie. The cookie holds a random
+   * session id, NOT the token: a leaked cookie is revocable and expires, a
+   * leaked token is the key to the building.
+   */
+  app.post<{ Body: { token: string } }>(
+    "/auth/login",
+    { schema: { body: loginBodySchema } },
+    async (req, reply) => {
+      // Same 401 as a wrong token when no token is configured: logging in is
+      // meaningless without one, and the answer must not depend on the secret.
+      if (auth === undefined || !tokensMatch(req.body.token, auth.token)) {
+        return reply.code(401).send({ error: "invalid token" });
+      }
+      return reply
+        .header(
+          "set-cookie",
+          serializeCookie(SESSION_COOKIE, sessions.create(), {
+            maxAge: Math.floor(DEFAULT_SESSION_TTL_MS / 1000),
+          }),
+        )
+        .code(200)
+        .send({ ok: true });
+    },
+  );
+
+  /**
+   * Revokes the session server-side AND clears the cookie. Exempt from the
+   * guard: logging out with an already-dead session must clear the browser's
+   * stale cookie rather than 401, or the UI can get stuck showing a session it
+   * cannot use and cannot drop.
+   */
+  app.post("/auth/logout", async (req, reply) => {
+    sessions.revoke(sessionIdOf(req.headers.cookie));
+    return reply
+      .header("set-cookie", serializeCookie(SESSION_COOKIE, "", { maxAge: 0 }))
+      .code(200)
+      .send({ ok: true });
+  });
+
+  /**
+   * What the UI needs to decide between the login form and the dashboard.
+   * Reachable unauthenticated by design; it discloses only whether a token is
+   * configured, which any 401 already reveals.
+   */
+  app.get("/auth/status", async (req) => ({
+    authRequired: auth !== undefined,
+    authenticated: isAuthenticated(req),
+  }));
 
   app.get("/health", async () => ({ status: "ok" }));
 
@@ -488,11 +666,7 @@ export function buildApp(
       // Matched on the PATH, not the accept header: a header-based rule only
       // holds for clients that happen to send one, and the failure it guards
       // against is precisely a client receiving HTML it did not expect.
-      const path = req.url.split("?")[0] ?? "";
-      const isApi = API_PREFIXES.some(
-        (p) => path === p || path.startsWith(`${p}/`),
-      );
-      if (req.method !== "GET" || isApi) {
+      if (req.method !== "GET" || isApiPath(pathOf(req.url))) {
         return reply.code(404).send({ error: "not found" });
       }
       return reply.sendFile("index.html");

@@ -15,7 +15,7 @@ import {
   type StoredEntry,
 } from "../src/db.js";
 import type { Event, Message } from "../src/types.js";
-import { buildApp } from "../src/app.js";
+import { buildApp, type BuildAppOptions } from "../src/app.js";
 import { createSseHub, type SseHub } from "../src/sse.js";
 import type { TurnResult } from "../src/chat/bridge.js";
 import type { CommandRunner } from "../src/collectors/liveness.js";
@@ -1448,5 +1448,367 @@ describe("GET /chat/history", () => {
     const res = await app.inject({ method: "GET", url: "/chat/history" });
     expect(res.statusCode).toBe(200);
     expect(res.json()).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Auth (PRD Q2). The guard exists only when a token is INJECTED, which is why
+// every test above still passes untouched: none of them configures one.
+// ---------------------------------------------------------------------------
+
+const TOKEN = "correct-horse-battery-staple";
+const COOKIE = "dash_session";
+
+function makeAuthApp(
+  token?: string,
+  extra?: { uiDir?: string; stop?: BuildAppOptions["stop"]; chat?: FakeBridge },
+): { app: FastifyInstance; db: Database.Database } {
+  const db = makeDb();
+  const app = buildApp(db, {
+    auth: token === undefined ? undefined : { token },
+    uiDir: extra?.uiDir,
+    stop: extra?.stop,
+    chat: extra?.chat,
+  });
+  return { app, db };
+}
+
+/** Fastify's inject exposes set-cookie as a string or an array; normalise. */
+function setCookies(res: { headers: Record<string, unknown> }): string[] {
+  const raw = res.headers["set-cookie"];
+  if (raw === undefined) return [];
+  return Array.isArray(raw) ? (raw as string[]) : [raw as string];
+}
+
+function sessionCookieFrom(res: { headers: Record<string, unknown> }): string {
+  const header = setCookies(res).find((c) => c.startsWith(`${COOKIE}=`));
+  if (header === undefined) throw new Error("no session cookie was set");
+  return header.split(";")[0] as string;
+}
+
+/** Every path that must be behind the guard, with a method that reaches it. */
+const PROTECTED: ReadonlyArray<{ method: "GET" | "POST"; url: string }> = [
+  { method: "GET", url: "/agents" },
+  { method: "GET", url: "/features" },
+  { method: "GET", url: "/events" },
+  { method: "GET", url: "/messages" },
+  { method: "GET", url: "/threads" },
+  { method: "GET", url: "/agents/payments/entries" },
+  { method: "POST", url: "/agents/payments/stop" },
+  { method: "POST", url: "/chat" },
+  { method: "GET", url: "/chat/history" },
+  { method: "POST", url: "/ingest" },
+  { method: "GET", url: "/live" },
+];
+
+describe("auth: not configured", () => {
+  it("registers no guard at all — every route behaves as before", async () => {
+    const { app } = makeAuthApp();
+    for (const route of PROTECTED) {
+      if (route.url === "/live") continue; // never completes; covered below
+      const res = await app.inject({
+        method: route.method,
+        url: route.url,
+        payload: route.method === "POST" ? { type: "t", text: "hi" } : undefined,
+      });
+      expect(res.statusCode, `${route.method} ${route.url}`).not.toBe(401);
+    }
+  });
+
+  it("reports authRequired:false so the UI shows no login form", async () => {
+    const { app } = makeAuthApp();
+    const res = await app.inject({ method: "GET", url: "/auth/status" });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ authRequired: false, authenticated: false });
+  });
+
+  it("refuses to mint a session when there is no token to match", async () => {
+    const { app } = makeAuthApp();
+    const res = await app.inject({
+      method: "POST",
+      url: "/auth/login",
+      payload: { token: "anything" },
+    });
+    expect(res.statusCode).toBe(401);
+    expect(setCookies(res)).toHaveLength(0);
+  });
+});
+
+describe("auth: the guard", () => {
+  it("401s every protected route when no credential is presented", async () => {
+    const { app } = makeAuthApp(TOKEN, {
+      stop: { session: "agents", runner: okStopRunner() },
+      chat: fakeBridge(),
+    });
+    for (const route of PROTECTED) {
+      const res = await app.inject({
+        method: route.method,
+        url: route.url,
+        payload: route.method === "POST" ? { type: "t", text: "hi" } : undefined,
+      });
+      expect(res.statusCode, `${route.method} ${route.url}`).toBe(401);
+    }
+  });
+
+  it("answers 401 as JSON and never as a redirect", async () => {
+    const { app } = makeAuthApp(TOKEN);
+    const res = await app.inject({ method: "GET", url: "/agents" });
+    expect(res.statusCode).toBe(401);
+    expect(res.headers["content-type"]).toContain("application/json");
+    expect(res.headers.location).toBeUndefined();
+    expect(res.json()).toHaveProperty("error");
+  });
+
+  it("leaves /health open for liveness probes", async () => {
+    const { app } = makeAuthApp(TOKEN);
+    const res = await app.inject({ method: "GET", url: "/health" });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ status: "ok" });
+  });
+
+  it("leaves /auth/status open so the UI can discover it must log in", async () => {
+    const { app } = makeAuthApp(TOKEN);
+    const res = await app.inject({ method: "GET", url: "/auth/status" });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ authRequired: true, authenticated: false });
+  });
+
+  it("accepts a matching Authorization: Bearer token (hooks and curl)", async () => {
+    const { app } = makeAuthApp(TOKEN);
+    const res = await app.inject({
+      method: "POST",
+      url: "/ingest",
+      headers: { authorization: `Bearer ${TOKEN}` },
+      payload: { agent: "payments", type: "hook", payload: {} },
+    });
+    expect(res.statusCode).toBe(201);
+  });
+
+  it("rejects a wrong, malformed or empty bearer token", async () => {
+    const { app } = makeAuthApp(TOKEN);
+    for (const authorization of [
+      `Bearer ${TOKEN}x`,
+      "Bearer ",
+      "Bearer",
+      TOKEN,
+      `Basic ${TOKEN}`,
+      "",
+    ]) {
+      const res = await app.inject({
+        method: "GET",
+        url: "/agents",
+        headers: { authorization },
+      });
+      expect(res.statusCode, authorization).toBe(401);
+    }
+  });
+
+  it("accepts a valid session cookie", async () => {
+    const { app } = makeAuthApp(TOKEN);
+    const login = await app.inject({
+      method: "POST",
+      url: "/auth/login",
+      payload: { token: TOKEN },
+    });
+    const cookie = sessionCookieFrom(login);
+
+    const res = await app.inject({
+      method: "GET",
+      url: "/agents",
+      headers: { cookie },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual([]);
+  });
+
+  it("rejects a forged or unknown session id", async () => {
+    const { app } = makeAuthApp(TOKEN);
+    for (const cookie of [
+      `${COOKIE}=deadbeef`,
+      `${COOKIE}=`,
+      `${COOKIE}=${TOKEN}`, // the token itself is not a session id
+      "other=1",
+    ]) {
+      const res = await app.inject({
+        method: "GET",
+        url: "/agents",
+        headers: { cookie },
+      });
+      expect(res.statusCode, cookie).toBe(401);
+    }
+  });
+});
+
+describe("auth: /auth/login", () => {
+  it("sets an httpOnly SameSite=Strict Path=/ cookie and 200s on a match", async () => {
+    const { app } = makeAuthApp(TOKEN);
+    const res = await app.inject({
+      method: "POST",
+      url: "/auth/login",
+      payload: { token: TOKEN },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ ok: true });
+
+    const header = setCookies(res).find((c) => c.startsWith(`${COOKIE}=`));
+    expect(header).toBeDefined();
+    expect(header).toContain("HttpOnly");
+    expect(header).toContain("SameSite=Strict");
+    expect(header).toContain("Path=/");
+  });
+
+  it("puts a random session id in the cookie, never the token itself", async () => {
+    const { app } = makeAuthApp(TOKEN);
+    const a = await app.inject({
+      method: "POST",
+      url: "/auth/login",
+      payload: { token: TOKEN },
+    });
+    const b = await app.inject({
+      method: "POST",
+      url: "/auth/login",
+      payload: { token: TOKEN },
+    });
+
+    const idA = sessionCookieFrom(a).slice(COOKIE.length + 1);
+    const idB = sessionCookieFrom(b).slice(COOKIE.length + 1);
+    expect(idA).not.toContain(TOKEN);
+    expect(idA).not.toBe(idB);
+    expect(idA.length).toBeGreaterThanOrEqual(32);
+  });
+
+  it("401s on a wrong token and sets NOTHING", async () => {
+    const { app } = makeAuthApp(TOKEN);
+    const res = await app.inject({
+      method: "POST",
+      url: "/auth/login",
+      payload: { token: "wrong" },
+    });
+    expect(res.statusCode).toBe(401);
+    expect(setCookies(res)).toHaveLength(0);
+  });
+
+  it("400s a missing or non-string token (ajv, coerceTypes off)", async () => {
+    const { app } = makeAuthApp(TOKEN);
+    for (const payload of [{}, { token: 42 }, { token: null }, { token: ["x"] }]) {
+      const res = await app.inject({ method: "POST", url: "/auth/login", payload });
+      expect(res.statusCode, JSON.stringify(payload)).toBe(400);
+      expect(setCookies(res)).toHaveLength(0);
+    }
+  });
+});
+
+describe("auth: /auth/logout and /auth/status", () => {
+  it("revokes the session, so the cookie stops working", async () => {
+    const { app } = makeAuthApp(TOKEN);
+    const cookie = sessionCookieFrom(
+      await app.inject({ method: "POST", url: "/auth/login", payload: { token: TOKEN } }),
+    );
+
+    expect((await app.inject({ method: "GET", url: "/agents", headers: { cookie } })).statusCode).toBe(200);
+
+    const out = await app.inject({ method: "POST", url: "/auth/logout", headers: { cookie } });
+    expect(out.statusCode).toBe(200);
+    const cleared = setCookies(out).find((c) => c.startsWith(`${COOKIE}=`));
+    expect(cleared).toContain("Max-Age=0");
+
+    const after = await app.inject({ method: "GET", url: "/agents", headers: { cookie } });
+    expect(after.statusCode).toBe(401);
+  });
+
+  it("clears the cookie even when called with no session at all", async () => {
+    const { app } = makeAuthApp(TOKEN);
+    const res = await app.inject({ method: "POST", url: "/auth/logout" });
+    expect(res.statusCode).toBe(200);
+    expect(setCookies(res).find((c) => c.startsWith(`${COOKIE}=`))).toContain("Max-Age=0");
+  });
+
+  it("reports authenticated:true once a session cookie is presented", async () => {
+    const { app } = makeAuthApp(TOKEN);
+    const cookie = sessionCookieFrom(
+      await app.inject({ method: "POST", url: "/auth/login", payload: { token: TOKEN } }),
+    );
+    const res = await app.inject({ method: "GET", url: "/auth/status", headers: { cookie } });
+    expect(res.json()).toEqual({ authRequired: true, authenticated: true });
+  });
+
+  it("reports authenticated:true for a bearer token too", async () => {
+    const { app } = makeAuthApp(TOKEN);
+    const res = await app.inject({
+      method: "GET",
+      url: "/auth/status",
+      headers: { authorization: `Bearer ${TOKEN}` },
+    });
+    expect(res.json()).toEqual({ authRequired: true, authenticated: true });
+  });
+});
+
+describe("auth: static assets stay reachable", () => {
+  function uiDir(): string {
+    const dir = mkdtempSync(join(tmpdir(), "ui-auth-"));
+    writeFileSync(join(dir, "index.html"), "<!doctype html><title>Dash</title>");
+    writeFileSync(join(dir, "app.js"), "console.log('bundle')");
+    return dir;
+  }
+
+  it("serves the login page and its bundle without a credential", async () => {
+    const dir = uiDir();
+    const { app } = makeAuthApp(TOKEN, { uiDir: dir });
+
+    const index = await app.inject({ method: "GET", url: "/" });
+    expect(index.statusCode).toBe(200);
+    expect(index.body).toContain("Dash");
+
+    const bundle = await app.inject({ method: "GET", url: "/app.js" });
+    expect(bundle.statusCode).toBe(200);
+
+    // A client-side route must still land on the shell, so a deep link shows
+    // the login form rather than a bare 401.
+    const deep = await app.inject({ method: "GET", url: "/agent/payments" });
+    expect(deep.statusCode).toBe(200);
+    expect(deep.body).toContain("Dash");
+
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("does NOT let the static exemption leak an API route", async () => {
+    const dir = uiDir();
+    const { app } = makeAuthApp(TOKEN, {
+      uiDir: dir,
+      stop: { session: "agents", runner: okStopRunner() },
+      chat: fakeBridge(),
+    });
+
+    for (const route of PROTECTED) {
+      const res = await app.inject({
+        method: route.method,
+        url: route.url,
+        payload: route.method === "POST" ? { type: "t", text: "hi" } : undefined,
+      });
+      expect(res.statusCode, `${route.method} ${route.url}`).toBe(401);
+      expect(res.body, `${route.method} ${route.url}`).not.toContain("Dash");
+    }
+
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("keeps /auth off the SPA fallback so login is never shadowed", async () => {
+    const dir = uiDir();
+    // With auth off, /auth is still an API prefix: an unknown path under it
+    // must 404 as JSON rather than being answered with the app shell.
+    const { app: open } = makeAuthApp(undefined, { uiDir: dir });
+    const openRes = await open.inject({ method: "GET", url: "/auth/nope" });
+    expect(openRes.statusCode).toBe(404);
+    expect(openRes.body).not.toContain("Dash");
+    expect(openRes.json()).toHaveProperty("error");
+
+    // With auth on it is guarded before it can be routed at all — 401, and
+    // still never the login page's own HTML.
+    const { app } = makeAuthApp(TOKEN, { uiDir: dir });
+    const res = await app.inject({ method: "GET", url: "/auth/nope" });
+    expect(res.statusCode).toBe(401);
+    expect(res.body).not.toContain("Dash");
+    rmSync(dir, { recursive: true, force: true });
   });
 });

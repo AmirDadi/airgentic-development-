@@ -69,6 +69,11 @@ function fakeApi(over: Partial<ApiClient> = {}): ApiClient {
       agent: "payments",
       ts: 1,
     })),
+    // Auth off is the default for existing deployments, so every test that
+    // predates the login gate keeps describing the same app.
+    authStatus: vi.fn(async () => ({ authRequired: false, authenticated: false })),
+    login: vi.fn(async () => ({ ok: true as const })),
+    logout: vi.fn(async () => ({ ok: true as const })),
     ...over,
   };
 }
@@ -579,5 +584,136 @@ describe("App chat drawer", () => {
     expect(screen.getByText(/no lead/i)).toBeInTheDocument();
     // The dashboard itself keeps working.
     expect(screen.getByText("running tests")).toBeInTheDocument();
+  });
+});
+
+describe("App login gate", () => {
+  const tokenField = () => screen.getByLabelText(/token/i);
+  const signIn = () => screen.getByRole("button", { name: /sign in|log in/i });
+
+  it("renders only the login gate when auth is required and nobody is signed in", async () => {
+    const api = fakeApi({
+      authStatus: vi.fn(async () => ({ authRequired: true, authenticated: false })),
+    });
+    renderApp(api);
+
+    expect(await screen.findByLabelText(/token/i)).toBeInTheDocument();
+    // No dashboard behind the gate — not even the chat toggle.
+    expect(screen.queryByText("running tests")).not.toBeInTheDocument();
+    expect(screen.queryByRole("tab", { name: /pipeline/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /^chat$/i })).not.toBeInTheDocument();
+  });
+
+  it("issues no dashboard requests while gated, so nothing leaks a 401", async () => {
+    const api = fakeApi({
+      authStatus: vi.fn(async () => ({ authRequired: true, authenticated: false })),
+    });
+    renderApp(api);
+    await screen.findByLabelText(/token/i);
+
+    expect(api.agents).not.toHaveBeenCalled();
+    expect(api.features).not.toHaveBeenCalled();
+    expect(api.threads).not.toHaveBeenCalled();
+    expect(api.chatHistory).not.toHaveBeenCalled();
+  });
+
+  it("logs in with the typed token, re-checks status, then loads the dashboard", async () => {
+    const authStatus = vi
+      .fn()
+      .mockResolvedValueOnce({ authRequired: true, authenticated: false })
+      .mockResolvedValue({ authRequired: true, authenticated: true });
+    const api = fakeApi({ authStatus });
+    renderApp(api);
+
+    await userEvent.type(await screen.findByLabelText(/token/i), "s3cret{Enter}");
+
+    await waitFor(() => expect(api.login).toHaveBeenCalledWith("s3cret"));
+    // The cookie is httpOnly, so the only way to know it worked is to re-ask.
+    await waitFor(() => expect(authStatus).toHaveBeenCalledTimes(2));
+    expect(await screen.findByText("running tests")).toBeInTheDocument();
+    expect(screen.queryByLabelText(/token/i)).not.toBeInTheDocument();
+  });
+
+  it("keeps the gate and shows an error when the token is rejected", async () => {
+    const api = fakeApi({
+      authStatus: vi.fn(async () => ({ authRequired: true, authenticated: false })),
+      login: vi.fn(async () => {
+        throw new ApiError("bad token", 401);
+      }),
+    });
+    renderApp(api);
+
+    await userEvent.type(await screen.findByLabelText(/token/i), "wrong{Enter}");
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(/not accepted/i);
+    // Still gated, and still usable for another attempt.
+    expect(tokenField()).toBeInTheDocument();
+    expect(tokenField()).not.toBeDisabled();
+    expect(screen.queryByText("running tests")).not.toBeInTheDocument();
+    expect(api.agents).not.toHaveBeenCalled();
+  });
+
+  it("falls back to the gate when a dashboard call 401s mid-session", async () => {
+    // Sessions live in memory: a server restart invalidates the cookie while
+    // the page is open. That must show the gate, not a broken empty dashboard.
+    const api = fakeApi({
+      authStatus: vi.fn(async () => ({ authRequired: true, authenticated: true })),
+      agents: vi.fn(async () => {
+        throw new ApiError("unauthorized", 401);
+      }),
+    });
+    renderApp(api);
+
+    expect(await screen.findByLabelText(/token/i)).toBeInTheDocument();
+    expect(signIn()).toBeInTheDocument();
+    // Not the generic "unreachable" banner — that would send the user to check
+    // the network for what is actually an expired session.
+    expect(screen.queryByText(/unreachable/i)).not.toBeInTheDocument();
+  });
+
+  it("keeps the ordinary failure banner for a non-401 backend failure", async () => {
+    const api = fakeApi({
+      agents: vi.fn(async () => {
+        throw new ApiError("boom", 503);
+      }),
+    });
+    renderApp(api);
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(/unreachable/i);
+    expect(screen.queryByLabelText(/token/i)).not.toBeInTheDocument();
+  });
+
+  it("shows no gate and no logout control when auth is not required", async () => {
+    renderApp();
+
+    expect(await screen.findByText("running tests")).toBeInTheDocument();
+    expect(screen.queryByLabelText(/token/i)).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /log out|sign out/i })).not.toBeInTheDocument();
+  });
+
+  it("treats an api without authStatus as auth not required rather than crashing", async () => {
+    // Older fakes (and any caller holding a pre-auth client) omit the method.
+    const api = fakeApi();
+    delete (api as Partial<ApiClient>).authStatus;
+    renderApp(api as ApiClient);
+
+    expect(await screen.findByText("running tests")).toBeInTheDocument();
+    expect(screen.queryByLabelText(/token/i)).not.toBeInTheDocument();
+  });
+
+  it("offers a logout control that ends the session and returns to the gate", async () => {
+    const authStatus = vi
+      .fn()
+      .mockResolvedValueOnce({ authRequired: true, authenticated: true })
+      .mockResolvedValue({ authRequired: true, authenticated: false });
+    const api = fakeApi({ authStatus });
+    renderApp(api);
+    await screen.findByText("running tests");
+
+    await userEvent.click(screen.getByRole("button", { name: /log out|sign out/i }));
+
+    await waitFor(() => expect(api.logout).toHaveBeenCalledTimes(1));
+    expect(await screen.findByLabelText(/token/i)).toBeInTheDocument();
+    expect(screen.queryByText("running tests")).not.toBeInTheDocument();
   });
 });
