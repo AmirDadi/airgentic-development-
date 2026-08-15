@@ -16,6 +16,7 @@ import { createSseHub, type SseHub } from "./sse.js";
 import { redact } from "./redact.js";
 import type { Bridge } from "./chat/bridge.js";
 import { createTurnQueue } from "./chat/queue.js";
+import { createStreamRedactor } from "./chat/stream-redactor.js";
 import fastifyStatic from "@fastify/static";
 
 /**
@@ -273,19 +274,6 @@ export function buildApp(
 
       const turnId = randomUUID();
 
-      // Stored before the turn runs, so the human's words survive a lead that
-      // never answers. Redacted first (PRD R4) — a credential that never
-      // lands in SQLite cannot leak from it.
-      insertMessage(db, {
-        id: `${turnId}:in`,
-        ts: Date.now(),
-        from_agent: user,
-        to_agent: WEB_LEAD,
-        channel: "human_web",
-        body: redact(text),
-        session_id: null,
-      });
-
       // Name-tagged so the lead knows who is speaking; the raw text goes to
       // the agent (redaction is a storage concern, not a delivery one).
       const prompt = `${user}: ${text}`;
@@ -293,9 +281,32 @@ export function buildApp(
       // Deliberately not awaited: the response is 202 and the work continues
       // on the queue. Every failure path inside ends in a `chat` error frame.
       void chatQueue.push(async () => {
+        // The human message is stored INSIDE the serialized turn, not in the
+        // handler: storing it in the handler let two overlapping users land as
+        // in,in,out,out in the DB, and the history pairing then crossed one
+        // person's prompt with another's reply. Serialized, each turn's two
+        // rows stay adjacent. Redacted first (PRD R4).
+        insertMessage(db, {
+          id: `${turnId}:in`,
+          ts: Date.now(),
+          from_agent: user,
+          to_agent: WEB_LEAD,
+          channel: "human_web",
+          body: redact(text),
+          session_id: null,
+        });
+
+        // The delta frames go to browsers before the reply is complete, so a
+        // secret split across deltas would reach the DOM raw. Redact the
+        // stream incrementally — never emitting a fragment that could still be
+        // part of a secret (PRD R4). Storage is redacted separately below.
+        const streamRedactor = createStreamRedactor();
         try {
           const result = await bridge.runTurn(prompt, (delta) => {
-            hub.broadcast("chat", { turnId, kind: "delta", text: delta });
+            const safe = streamRedactor.push(delta);
+            if (safe.length > 0) {
+              hub.broadcast("chat", { turnId, kind: "delta", text: safe });
+            }
           });
 
           if (!result.ok) {
@@ -316,7 +327,14 @@ export function buildApp(
             body: redact(result.text),
             session_id: null,
           });
-          hub.broadcast("chat", { turnId, kind: "final", text: result.text });
+          // The final frame REPLACES the streamed reply in the UI, so it
+          // carries the whole redacted text. Previously it sent result.text
+          // raw — the R4 leak this closes.
+          hub.broadcast("chat", {
+            turnId,
+            kind: "final",
+            text: redact(result.text),
+          });
         } catch (err) {
           // A bridge that throws is a bug in the bridge, not a reason for the
           // browser to wait forever on a turn that will never finish.

@@ -304,18 +304,18 @@ describe("App chat drawer", () => {
     const api = fakeApi({
       chatHistory: vi.fn(async () => [
         {
-          id: "m1",
+          id: "t1:in",
           ts: 1,
           from_agent: "Amirreza",
-          to_agent: "lead",
+          to_agent: "web-lead",
           channel: "human_web" as const,
           body: "how is checkout?",
           session_id: null,
         },
         {
-          id: "m2",
+          id: "t1:out",
           ts: 2,
-          from_agent: "lead",
+          from_agent: "web-lead",
           to_agent: "Amirreza",
           channel: "human_web" as const,
           body: "spec is merged",
@@ -334,6 +334,31 @@ describe("App chat drawer", () => {
     expect(
       screen.queryByRole("status", { name: /reply in progress/i }),
     ).not.toBeInTheDocument();
+  });
+
+  it("pairs history by turn id, not by position, so interleaved users don't cross", async () => {
+    // Two people share one lead. Even serialized, a failed turn (prompt with no
+    // reply) or any interleaving breaks strict-alternation pairing — Bob's
+    // prompt would be shown as the answer to Alice. Pairing by the turn id in
+    // the message id keeps each turn intact.
+    const api = fakeApi({
+      chatHistory: vi.fn(async () => [
+        { id: "tA:in", ts: 1, from_agent: "Alice", to_agent: "web-lead", channel: "human_web" as const, body: "alice asks", session_id: null },
+        { id: "tB:in", ts: 2, from_agent: "Bob", to_agent: "web-lead", channel: "human_web" as const, body: "bob asks", session_id: null },
+        { id: "tA:out", ts: 3, from_agent: "web-lead", to_agent: "Alice", channel: "human_web" as const, body: "answer for alice", session_id: null },
+        { id: "tB:out", ts: 4, from_agent: "web-lead", to_agent: "Bob", channel: "human_web" as const, body: "answer for bob", session_id: null },
+      ]),
+    });
+    renderApp(api);
+    await screen.findByText("payments");
+    await userEvent.click(chatToggle());
+
+    // Alice's turn shows Alice's prompt paired with Alice's answer — not Bob's.
+    const alicePrompt = await screen.findByText("alice asks");
+    const aliceTurn = alicePrompt.closest("li") ?? alicePrompt.parentElement!;
+    expect(aliceTurn).toHaveTextContent("answer for alice");
+    expect(aliceTurn).not.toHaveTextContent("bob asks");
+    expect(aliceTurn).not.toHaveTextContent("answer for bob");
   });
 
   it("keeps the dashboard usable when chat history fails to load", async () => {

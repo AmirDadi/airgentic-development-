@@ -942,14 +942,15 @@ describe("POST /chat", () => {
 });
 
 describe("chat SSE frames", () => {
-  it("broadcasts deltas, then a final, all tagged with the turn id", async () => {
+  it("streams safe deltas as whitespace commits them, then a final", async () => {
     const hub = createSseHub();
     const send = vi.fn();
     hub.subscribe(send);
+    // A trailing space after each word lets the incremental redactor commit it.
     const bridge = fakeBridge(async (_p, onDelta) => {
-      onDelta("Hel");
-      onDelta("lo");
-      return { ok: true, text: "Hello", usage: 0.01 };
+      onDelta("the build ");
+      onDelta("is green ");
+      return { ok: true, text: "the build is green", usage: 0.01 };
     });
     const { app } = makeChatApp(bridge, hub);
 
@@ -957,14 +958,52 @@ describe("chat SSE frames", () => {
       await app.inject({ method: "POST", url: "/chat", payload: { text: "hi" } })
     ).json();
 
-    await vi.waitFor(() => expect(send).toHaveBeenCalledTimes(3));
-    const frames = send.mock.calls as [string, Record<string, unknown>][];
-    expect(frames.map((f) => f[0])).toEqual(["chat", "chat", "chat"]);
-    expect(frames.map((f) => f[1])).toEqual([
-      { turnId, kind: "delta", text: "Hel" },
-      { turnId, kind: "delta", text: "lo" },
-      { turnId, kind: "final", text: "Hello" },
-    ]);
+    await vi.waitFor(() =>
+      expect(
+        send.mock.calls.some((c) => (c[1] as { kind?: string }).kind === "final"),
+      ).toBe(true),
+    );
+    const frames = (send.mock.calls as [string, Record<string, unknown>][]).map(
+      (f) => f[1],
+    );
+    expect(send.mock.calls.every((c) => c[0] === "chat")).toBe(true);
+    expect(frames.every((f) => f.turnId === turnId)).toBe(true);
+    // It streamed incrementally rather than dumping everything on `final`.
+    const deltas = frames
+      .filter((f) => f.kind === "delta")
+      .map((f) => f.text)
+      .join("");
+    expect(deltas.length).toBeGreaterThan(0);
+    expect(frames.find((f) => f.kind === "final")?.text).toBe("the build is green");
+  });
+
+  it("never broadcasts a secret split across deltas (R4 over the live stream)", async () => {
+    // Regression: delta and final frames were broadcast raw while only storage
+    // was redacted, so a planted key streamed to every browser verbatim.
+    const hub = createSseHub();
+    const send = vi.fn();
+    hub.subscribe(send);
+    const KEY = "sk-ant-api03-FAKEfake0000FAKEfake1111FAKEfake2222AA";
+    const bridge = fakeBridge(async (_p, onDelta) => {
+      // The key arrives one fragment at a time — no single delta contains it.
+      onDelta("token ");
+      onDelta("sk-ant-");
+      onDelta("api03-FAKEfake0000FAKEfake1111FAKEfake2222AA");
+      onDelta(" end");
+      return { ok: true, text: `token ${KEY} end`, usage: null };
+    });
+    const { app } = makeChatApp(bridge, hub);
+
+    await app.inject({ method: "POST", url: "/chat", payload: { text: "leak?" } });
+
+    await vi.waitFor(() =>
+      expect(
+        send.mock.calls.some((c) => (c[1] as { kind?: string }).kind === "final"),
+      ).toBe(true),
+    );
+    const allBroadcast = JSON.stringify(send.mock.calls.map((c) => c[1]));
+    expect(allBroadcast).not.toContain(KEY);
+    expect(allBroadcast).toContain("[REDACTED:anthropic-key]");
   });
 
   it("broadcasts an error frame when the turn fails", async () => {

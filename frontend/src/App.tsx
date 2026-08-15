@@ -11,30 +11,39 @@ import type { Agent, Feature, Message, StoredEntry, Thread } from "./types";
 /** Shown when the backend reports it has no web lead to talk to. */
 const NO_LEAD = "No lead agent is configured — chat is unavailable.";
 
+/** The turn id a stored chat message belongs to (its id is `<turnId>:in|out`). */
+function turnIdOf(m: Message): string {
+  return m.id.replace(/:(in|out)$/, "");
+}
+
 /**
  * Stored `human_web` messages are a flat oldest-first list; the drawer wants
- * prompt/reply pairs. Each message either answers the turn still awaiting a
- * reply or opens a new one, so an unanswered trailing prompt survives instead
- * of being dropped.
+ * prompt/reply pairs. Pairing is by TURN ID (the `<turnId>:in` / `:out` in the
+ * message id), not by position: several people share one lead, so a failed
+ * turn (prompt with no reply) or any interleaving would otherwise attribute one
+ * person's message to another. First-seen turn order is preserved.
  */
 function turnsFromHistory(messages: Message[]): ChatTurn[] {
-  const turns: ChatTurn[] = [];
+  const byTurn = new Map<string, ChatTurn>();
+  const order: string[] = [];
   for (const m of messages) {
-    const open = turns[turns.length - 1];
-    if (open !== undefined && open.reply === "") {
-      open.reply = m.body;
+    const id = turnIdOf(m);
+    const isReply = m.id.endsWith(":out");
+    let turn = byTurn.get(id);
+    if (turn === undefined) {
+      turn = { id, user: m.from_agent, text: "", reply: "", status: "done" };
+      byTurn.set(id, turn);
+      order.push(id);
+    }
+    if (isReply) {
+      turn.reply = m.body;
     } else {
-      turns.push({
-        id: m.id,
-        user: m.from_agent,
-        text: m.body,
-        reply: "",
-        // History is settled: nothing in it is still streaming.
-        status: "done",
-      });
+      // The prompt carries the human's name; the reply is from the lead.
+      turn.user = m.from_agent;
+      turn.text = m.body;
     }
   }
-  return turns;
+  return order.map((id) => byTurn.get(id)!);
 }
 
 const TABS = [

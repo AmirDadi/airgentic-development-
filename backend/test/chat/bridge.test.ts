@@ -413,3 +413,43 @@ describe("createBridge — failure modes", () => {
     expect(killed).toEqual(["kill"]);
   });
 });
+
+describe("createBridge — continuity survives restart", () => {
+  it("omits --continue on a truly fresh dir, includes it once a marker exists", async () => {
+    const { mkdtempSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+
+    const dir = mkdtempSync(join(tmpdir(), "bridge-cont-"));
+    try {
+      const argvs: string[][] = [];
+      const spawner: TurnSpawner = (argv) => {
+        argvs.push(argv);
+        return {
+          stdout: (async function* () {
+            yield JSON.stringify({ type: "result", is_error: false, result: "ok" });
+          })(),
+          exitCode: Promise.resolve(0),
+          kill() {},
+        } satisfies SpawnedTurn;
+      };
+
+      // First bridge, fresh dir: first turn omits --continue, and writing the
+      // marker means the SECOND turn includes it.
+      const b1 = createBridge({ cwd: dir, spawner });
+      await b1.runTurn("one", () => {});
+      await b1.runTurn("two", () => {});
+      expect(argvs[0]).not.toContain("--continue");
+      expect(argvs[1]).toContain("--continue");
+
+      // A NEW bridge over the same dir simulates a server restart. The marker
+      // persists, so its first turn must still include --continue rather than
+      // silently starting a fresh conversation.
+      const b2 = createBridge({ cwd: dir, spawner });
+      await b2.runTurn("after restart", () => {});
+      expect(argvs[2]).toContain("--continue");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

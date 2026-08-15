@@ -1,4 +1,6 @@
 import { spawn } from "node:child_process";
+import { existsSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { parseStreamLine } from "./stream-parser.js";
 
 /**
@@ -131,10 +133,25 @@ export const nodeSpawner: TurnSpawner = (argv, opts) => {
     stdout: child.stdout as AsyncIterable<string>,
     exitCode,
     kill: () => {
+      // SIGTERM first, but a `claude` that traps or ignores it would otherwise
+      // live forever — and a live session holds its inbox socket (SPIKE-R2),
+      // so an abandoned turn leaks both a process and an address. Escalate to
+      // SIGKILL if it has not exited within the grace period.
       child.kill("SIGTERM");
+      const grace = setTimeout(() => {
+        if (child.exitCode === null && child.signalCode === null) {
+          child.kill("SIGKILL");
+        }
+      }, SIGKILL_GRACE_MS);
+      grace.unref?.();
+      // Don't hold the timer past a clean exit.
+      child.once("close", () => clearTimeout(grace));
     },
   };
 };
+
+/** How long a killed turn may ignore SIGTERM before we SIGKILL it. */
+export const SIGKILL_GRACE_MS = 2_000;
 
 function describe(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
@@ -150,8 +167,18 @@ export function createBridge(opts: BridgeOptions): Bridge {
   // Continuity is only claimed once a turn has actually produced a result: if
   // the very first turn dies on launch, nothing was written to the session
   // directory and `--continue` would fail every subsequent turn too.
-  let established = false;
-  const isFirstTurn = opts.isFirstTurn ?? ((): boolean => !established);
+  //
+  // It is tracked on DISK, not just in memory: the `--continue` history lives
+  // in the (non-ephemeral) working directory and survives a server restart, so
+  // an in-memory flag would make the first turn after any restart wrongly omit
+  // `--continue` and silently lose the whole conversation. The marker file ties
+  // "have we ever completed a turn here" to the same directory that holds the
+  // history it gates.
+  const markerPath = join(opts.cwd, ".web-lead-established");
+  let established = false; // within this process
+  const isFirstTurn =
+    opts.isFirstTurn ??
+    ((): boolean => !established && !existsSync(markerPath));
 
   async function runTurn(
     prompt: string,
@@ -269,6 +296,14 @@ export function createBridge(opts: BridgeOptions): Bridge {
     }
 
     established = true;
+    // Persist the marker so a restart still knows this directory has history.
+    // Best-effort: a write failure must not fail a turn that already succeeded
+    // (worst case, the next turn after a restart omits --continue once).
+    try {
+      writeFileSync(markerPath, "");
+    } catch {
+      /* ignore */
+    }
     return { ok: true, text: finalText, usage };
   }
 
