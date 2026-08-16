@@ -29,7 +29,12 @@ import { groupIntoThreads } from "./threads.js";
 import type { SseHub } from "./sse.js";
 import { collectLiveness, type CommandRunner } from "./collectors/liveness.js";
 import { collectPipeline, type PrInfo } from "./collectors/pipeline.js";
-import { createGithubPrSource } from "./github.js";
+import {
+  createGithubArtifactSource,
+  createGithubBranchSource,
+  createGithubPrSource,
+  type ArtifactFlags,
+} from "./github.js";
 import {
   collectTranscripts,
   createTranscriptState,
@@ -50,6 +55,9 @@ export interface RuntimeOptions {
   runner?: CommandRunner;
   listBranches?: () => Promise<string[]>;
   listPrs?: () => Promise<Record<string, PrInfo>>;
+  listArtifacts?: () => Promise<Record<string, ArtifactFlags>>;
+  /** Injected for tests — the GitHub sources must never hit the network there. */
+  fetchFn?: typeof fetch;
   now?: () => number;
   setIntervalFn?: typeof setInterval;
   clearIntervalFn?: typeof clearInterval;
@@ -120,46 +128,100 @@ export function defaultListBranches(
 }
 
 /**
- * PR lookup, from the GitHub REST API.
- *
- * Configuration (env, both optional):
- *   GITHUB_REPO   "owner/repo" to poll for PRs. UNSET = no PR lookup at all,
- *                  which is the supported zero-config mode: the stage machine
- *                  degrades to the artifact/branch signals and the dashboard
- *                  still boots on a machine with no forge access.
- *   GITHUB_TOKEN  PAT used for the API. Omit for a public repo; without it the
- *                  poll shares the 60 req/hr anonymous rate limit.
- *
- * Read once at module load, on purpose: the poll cadence must not re-read env
- * (and re-build the client) every ten seconds. The source itself never throws
- * and returns its last known good snapshot on failure — see `github.ts`.
+ * Warns on the FIRST failure and then only when the reason changes: the
+ * sources poll every ten seconds, so a bad token must be visible but must not
+ * fill the log. One deduper per source, so a PR failure and a contents failure
+ * each surface once.
  */
-export const defaultListPrs: () => Promise<Record<string, PrInfo>> = (() => {
+function dedupedWarn(
+  what: string,
+  consequence: string,
+): (err: { status?: number; message: string }) => void {
+  let last = "";
+  return (err) => {
+    const key = `${err.status ?? ""}:${err.message}`;
+    if (key === last) return;
+    last = key;
+    console.warn(
+      `[dashboard] ${what} failed: ${err.message}. ${consequence}`,
+    );
+  };
+}
+
+/** The three pipeline signal seams, resolved from env + injected overrides. */
+interface PipelineSources {
+  listBranches: () => Promise<string[]>;
+  listPrs: () => Promise<Record<string, PrInfo>>;
+  listArtifacts: (() => Promise<Record<string, ArtifactFlags>>) | undefined;
+}
+
+/**
+ * Wires the pipeline's three signals — gate artifacts, branches, PRs.
+ *
+ * Configuration (env, all optional):
+ *   GITHUB_REPO      "owner/repo". When SET, the project repo is the source of
+ *                    truth for ALL THREE signals: gate artifacts come from the
+ *                    contents API, branches from the branches API, PRs from the
+ *                    pulls API. When UNSET (the zero-config mode), artifacts
+ *                    come from the local SPECS_DIR scan, branches from local
+ *                    git, and there is no PR signal at all.
+ *   GITHUB_TOKEN     PAT for the API. Omit for a public repo; without it the
+ *                    poll shares the 60 req/hr anonymous rate limit.
+ *   SPECS_REPO_PATH  Directory inside the repo holding the gate artifacts.
+ *                    Default "specs". Only meaningful with GITHUB_REPO.
+ *   SPECS_REF        Branch/ref the artifacts are read from. Default "main" —
+ *                    set it when the repo's default branch is anything else,
+ *                    or the contents call reads the wrong tree.
+ *
+ * Env is read ONCE per createRuntime call, on purpose: the poll cadence must
+ * not re-read env (and re-build the clients) every ten seconds, but a runtime
+ * constructed after the environment changes (tests, embedding) must see the
+ * change. An explicitly injected seam always wins over the env wiring. The
+ * sources themselves never throw and return their last known good snapshot on
+ * failure — see `github.ts`.
+ */
+function resolvePipelineSources(opts: RuntimeOptions, runner: CommandRunner): PipelineSources {
   const repo = process.env.GITHUB_REPO?.trim();
+
   if (repo === undefined || repo.length === 0) {
-    return async (): Promise<Record<string, PrInfo>> => ({});
+    // No forge configured: local artifacts scan (inside collectPipeline),
+    // local git branches, no PR signal.
+    return {
+      listBranches: opts.listBranches ?? defaultListBranches(runner),
+      listPrs: opts.listPrs ?? (async () => ({})),
+      listArtifacts: opts.listArtifacts,
+    };
   }
-  const token = process.env.GITHUB_TOKEN?.trim();
-  return createGithubPrSource({
-    repo,
-    token: token !== undefined && token.length > 0 ? token : undefined,
-    // Polls every 10s, so log the FIRST failure and then only when the reason
-    // changes: a bad token must be visible, but must not fill the log.
-    onError: (() => {
-      let last = "";
-      return (err: { status?: number; message: string }): void => {
-        const key = `${err.status ?? ""}:${err.message}`;
-        if (key === last) return;
-        last = key;
-        console.warn(
-          `[dashboard] GitHub PR lookup for ${repo} failed: ${err.message}. ` +
-            `Pipeline stages in_review/merge_ready/merged will not appear ` +
-            `until this is fixed.`,
-        );
-      };
-    })(),
-  });
-})();
+
+  const rawToken = process.env.GITHUB_TOKEN?.trim();
+  const token = rawToken !== undefined && rawToken.length > 0 ? rawToken : undefined;
+  const common = { repo, token, fetch: opts.fetchFn };
+  const consequence =
+    "Pipeline stages will be stale or missing until this is fixed.";
+
+  return {
+    listBranches:
+      opts.listBranches ??
+      createGithubBranchSource({
+        ...common,
+        onError: dedupedWarn(`GitHub branch lookup for ${repo}`, consequence),
+      }),
+    listPrs:
+      opts.listPrs ??
+      createGithubPrSource({
+        ...common,
+        onError: dedupedWarn(`GitHub PR lookup for ${repo}`, consequence),
+      }),
+    listArtifacts:
+      opts.listArtifacts ??
+      createGithubArtifactSource({
+        ...common,
+        specsPath: process.env.SPECS_REPO_PATH?.trim() || undefined,
+        ref: process.env.SPECS_REF?.trim() || undefined,
+        onError: dedupedWarn(`GitHub spec lookup for ${repo}`, consequence),
+      }),
+  };
+}
 
 /** Channels the frontend subscribes to. Renaming one silently breaks the UI. */
 const CHANNEL_AGENTS = "agents";
@@ -182,8 +244,10 @@ export function createRuntime(
   opts: RuntimeOptions,
 ): Runtime {
   const runner = opts.runner ?? defaultRunner;
-  const listBranches = opts.listBranches ?? defaultListBranches(runner);
-  const listPrs = opts.listPrs ?? defaultListPrs;
+  const { listBranches, listPrs, listArtifacts } = resolvePipelineSources(
+    opts,
+    runner,
+  );
   const now = opts.now ?? Date.now;
   const sources = opts.sources ?? [];
   const setIntervalFn = opts.setIntervalFn ?? setInterval;
@@ -307,6 +371,7 @@ export function createRuntime(
     safely(() =>
       collectPipeline(db, {
         specsDir: opts.specsDir,
+        listArtifacts,
         listBranches,
         listPrs,
         now,

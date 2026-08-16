@@ -10,8 +10,19 @@ export interface PrInfo {
 }
 
 export interface PipelineOptions {
-  /** Directory containing the gate artifacts. */
+  /**
+   * Directory containing the gate artifacts. UNUSED when `listArtifacts` is
+   * provided — the injected source then owns the artifact signal entirely.
+   */
   specsDir: string;
+  /**
+   * Injected: gate artifacts per feature name, e.g. from the project's GitHub
+   * repo. When present it REPLACES the local `specsDir` scan; when absent the
+   * local scan runs exactly as before.
+   */
+  listArtifacts?: () => Promise<
+    Record<string, { spec: boolean; interfaces: boolean; plan: boolean }>
+  >;
   /** Injected: branch names that exist, e.g. from `git for-each-ref`. */
   listBranches: () => Promise<string[]>;
   /** Injected: PR state per feature name. */
@@ -61,7 +72,12 @@ export async function collectPipeline(
   db: Database.Database,
   opts: PipelineOptions,
 ): Promise<void> {
-  const artifacts = await scanArtifacts(opts.specsDir);
+  // An injected artifact source (the project's GitHub repo) REPLACES the local
+  // scan outright — two sources of truth would disagree and flap stages.
+  const artifacts =
+    opts.listArtifacts !== undefined
+      ? toGateMap(await opts.listArtifacts())
+      : await scanArtifacts(opts.specsDir);
   const [branches, prs] = await Promise.all([opts.listBranches(), opts.listPrs()]);
 
   const names = new Set<string>([
@@ -99,6 +115,21 @@ export async function collectPipeline(
       updated_at,
     });
   }
+}
+
+/** Injected flags → the same Map/Set shape the local scan produces. */
+function toGateMap(
+  flags: Record<string, { spec: boolean; interfaces: boolean; plan: boolean }>,
+): Map<string, Set<Gate>> {
+  const found = new Map<string, Set<Gate>>();
+  for (const [name, gates] of Object.entries(flags)) {
+    const set = new Set<Gate>();
+    if (gates.spec) set.add("spec");
+    if (gates.interfaces) set.add("interfaces");
+    if (gates.plan) set.add("plan");
+    found.set(name, set);
+  }
+  return found;
 }
 
 /** Feature name → the set of gate artifacts present for it. */

@@ -531,3 +531,164 @@ describe("createRuntime — entries channel (P3 unit 4)", () => {
     expect(payload.entries).toHaveLength(2);
   });
 });
+
+describe("createRuntime — GitHub-sourced pipeline signals", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.restoreAllMocks();
+  });
+
+  function json(body: unknown, status = 200): Response {
+    return new Response(JSON.stringify(body), {
+      status,
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  /** Routes contents/branches/pulls; records every URL. Never the network. */
+  function githubFetch(over: {
+    contents?: unknown;
+    contentsStatus?: number;
+    branches?: unknown;
+    fail?: boolean;
+  } = {}): { fn: typeof fetch; calls: string[] } {
+    const calls: string[] = [];
+    const fn = (async (input: unknown) => {
+      const url = String(input);
+      calls.push(url);
+      if (over.fail === true) throw new Error("network down");
+      if (url.includes("/contents/")) {
+        return json(over.contents ?? [], over.contentsStatus ?? 200);
+      }
+      if (url.includes("/branches")) return json(over.branches ?? []);
+      return json([]); // pulls, reviews
+    }) as unknown as typeof fetch;
+    return { fn, calls };
+  }
+
+  const ghFile = (name: string) => ({ name, path: `specs/${name}`, type: "file" });
+
+  /** Runtime options with NO injected pipeline seams: env wiring must kick in. */
+  function ghOptions(hub: RuntimeOptions["hub"], fetchFn: typeof fetch): RuntimeOptions {
+    return {
+      hub,
+      session: "agents",
+      specsDir: dir,
+      runner: async () => tmuxOutput(["lead"]),
+      now: () => 1_000,
+      fetchFn,
+    };
+  }
+
+  it("sources artifacts and branches from GitHub when GITHUB_REPO is set", async () => {
+    vi.stubEnv("GITHUB_REPO", "acme/app");
+    const { hub } = fakeHub();
+    // A LOCAL spec file that must be IGNORED once GitHub is the source.
+    await writeFile(join(dir, "local-only.spec.md"), "# local\n");
+
+    const { fn, calls } = githubFetch({
+      contents: [
+        ghFile("checkout.spec.md"),
+        ghFile("checkout.interfaces.md"),
+        ghFile("checkout.plan.md"),
+      ],
+      branches: [{ name: "main" }, { name: "feat/checkout" }, { name: "feat/gh-branch" }],
+    });
+
+    const runtime = createRuntime(db, ghOptions(hub, fn));
+    await runtime.tick();
+
+    const rows = listFeatures(db);
+    expect(rows.map((f) => f.name).sort()).toEqual(["checkout", "gh-branch"]);
+    // all three gates + the GitHub branch → implementing
+    expect(rows.find((f) => f.name === "checkout")!.stage).toBe("implementing");
+    expect(rows.find((f) => f.name === "checkout")!.branch).toBe("feat/checkout");
+
+    expect(calls.some((u) => u.includes("/repos/acme/app/contents/specs?ref=main"))).toBe(true);
+    expect(calls.some((u) => u.includes("/repos/acme/app/branches"))).toBe(true);
+  });
+
+  it("honours SPECS_REPO_PATH and SPECS_REF", async () => {
+    vi.stubEnv("GITHUB_REPO", "acme/app");
+    vi.stubEnv("SPECS_REPO_PATH", "docs/specs");
+    vi.stubEnv("SPECS_REF", "develop");
+    const { hub } = fakeHub();
+    const { fn, calls } = githubFetch();
+
+    const runtime = createRuntime(db, ghOptions(hub, fn));
+    await runtime.tick();
+
+    expect(
+      calls.some((u) => u.includes("/repos/acme/app/contents/docs/specs?ref=develop")),
+    ).toBe(true);
+  });
+
+  it("injected listBranches/listArtifacts win over the env wiring", async () => {
+    vi.stubEnv("GITHUB_REPO", "acme/app");
+    const { hub } = fakeHub();
+    const { fn, calls } = githubFetch();
+
+    const runtime = createRuntime(db, {
+      ...ghOptions(hub, fn),
+      listBranches: async () => [],
+      listPrs: async () => ({}),
+      listArtifacts: async () => ({
+        injected: { spec: true, interfaces: false, plan: false },
+      }),
+    });
+    await runtime.tick();
+
+    expect(listFeatures(db).map((f) => f.name)).toEqual(["injected"]);
+    expect(calls).toEqual([]); // fully injected: GitHub never consulted
+  });
+
+  it("without GITHUB_REPO the local scan and injected git remain the source", async () => {
+    const { hub } = fakeHub();
+    await writeFile(join(dir, "local.spec.md"), "# local\n");
+    const { fn, calls } = githubFetch();
+
+    const runtime = createRuntime(db, {
+      ...ghOptions(hub, fn),
+      listBranches: async () => [],
+      listPrs: async () => ({}),
+    });
+    await runtime.tick();
+
+    expect(listFeatures(db).map((f) => f.name)).toEqual(["local"]);
+    expect(calls).toEqual([]);
+  });
+
+  it("a contents 404 (no specs dir yet) is silent and yields zero artifact features", async () => {
+    vi.stubEnv("GITHUB_REPO", "acme/app");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const { hub } = fakeHub();
+    const { fn } = githubFetch({
+      contents: { message: "Not Found" },
+      contentsStatus: 404,
+      branches: [{ name: "feat/gh-branch" }],
+    });
+
+    const runtime = createRuntime(db, ghOptions(hub, fn));
+    await runtime.tick();
+
+    expect(listFeatures(db).map((f) => f.name)).toEqual(["gh-branch"]);
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("warns once per failure reason, naming the consequence, and not per poll", async () => {
+    vi.stubEnv("GITHUB_REPO", "acme/app");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const { hub } = fakeHub();
+    const { fn } = githubFetch({ fail: true });
+
+    const runtime = createRuntime(db, ghOptions(hub, fn));
+    await runtime.tick();
+    const afterFirst = warn.mock.calls.length;
+    expect(afterFirst).toBeGreaterThan(0);
+    expect(String(warn.mock.calls[0]![0])).toMatch(/stale|missing/i);
+
+    await runtime.tick();
+    await runtime.tick();
+    expect(warn.mock.calls.length).toBe(afterFirst); // same reason → no re-log
+  });
+});

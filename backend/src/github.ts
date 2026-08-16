@@ -179,6 +179,201 @@ export function createGithubPrSource(
   };
 }
 
+/** The gate-artifact flags for one feature, mirroring `StageSignals.artifacts`. */
+export interface ArtifactFlags {
+  spec: boolean;
+  interfaces: boolean;
+  plan: boolean;
+}
+
+/**
+ * Same filename rule as `collectors/pipeline.ts`'s local scan; keep in step.
+ * Greedy name capture, so dotted feature names (`web-lead.v2.spec.md`) work.
+ */
+const GATE_FILE = /^(.+)\.(spec|interfaces|plan)\.md$/;
+
+/** Standard headers for every GitHub request this module makes. */
+function buildHeaders(token: string | undefined): Record<string, string> {
+  const headers: Record<string, string> = {
+    accept: "application/vnd.github+json",
+    "user-agent": USER_AGENT,
+  };
+  // Only send credentials when we have them: an empty Bearer is a 401, and
+  // anonymous reads work fine on a public repo.
+  if (typeof token === "string" && token.length > 0) {
+    headers.authorization = `Bearer ${token}`;
+  }
+  return headers;
+}
+
+/** Wraps `onError` so a broken sink can never break a poll. */
+function makeReporter(
+  onError: GithubOptions["onError"],
+): (err: { status?: number; message: string }) => void {
+  return (err) => {
+    try {
+      onError?.(err);
+    } catch {
+      /* a broken error sink is not worth failing a poll over */
+    }
+  };
+}
+
+/**
+ * Gate artifacts (`<feature>.{spec,interfaces,plan}.md`) read from the PROJECT
+ * repo via the contents API, keyed by feature name.
+ *
+ * This replaces the local `SPECS_DIR` scan when a GitHub repo is configured:
+ * specs live in the project's repo, so the repo is the source of truth. Same
+ * contract as the PR source — injected fetch, never throws, last-known-good on
+ * failure — with ONE deliberate difference: a 404 on the contents path is a
+ * repo that has no specs directory yet, which is a normal state, not an error.
+ * It resolves to `{}` (superseding any earlier snapshot) and does NOT fire
+ * `onError`.
+ */
+export function createGithubArtifactSource(
+  opts: GithubOptions & { specsPath?: string; ref?: string },
+): () => Promise<Record<string, ArtifactFlags>> {
+  const doFetch = opts.fetch ?? fetch;
+  const headers = buildHeaders(opts.token);
+  const report = makeReporter(opts.onError);
+
+  // Encode per segment so a nested path keeps its slashes, but the ref (which
+  // may itself contain a slash, e.g. release/1.0) is encoded whole: in a query
+  // value a literal "/" is ambiguous, an escaped one is not.
+  const specsPath = (opts.specsPath ?? "specs")
+    .split("/")
+    .map(encodeURIComponent)
+    .join("/");
+  const ref = encodeURIComponent(opts.ref ?? "main");
+  const url = `${API_ROOT}/repos/${opts.repo}/contents/${specsPath}?ref=${ref}`;
+
+  let lastGood: Record<string, ArtifactFlags> = {};
+
+  async function listArtifacts(): Promise<Record<string, ArtifactFlags>> {
+    let res: Response;
+    try {
+      res = await doFetch(url, { headers });
+    } catch (e) {
+      report({ message: (e as Error)?.message ?? "request failed" });
+      return lastGood;
+    }
+
+    // No specs directory (yet, or any more) is a normal state, not a failure:
+    // zero artifacts is the CORRECT answer, so it becomes the new snapshot.
+    if (res.status === 404) {
+      lastGood = {};
+      return lastGood;
+    }
+    if (!res.ok) {
+      report({ status: res.status, message: `GitHub returned ${res.status}` });
+      return lastGood;
+    }
+
+    let raw: unknown;
+    try {
+      raw = await res.json();
+    } catch (e) {
+      report({ message: (e as Error)?.message ?? "invalid JSON" });
+      return lastGood;
+    }
+    // The contents API returns an array for a directory; a non-array means the
+    // path names a file, or the body is an error envelope.
+    if (!Array.isArray(raw)) {
+      report({ message: "contents response is not a directory listing" });
+      return lastGood;
+    }
+
+    const result: Record<string, ArtifactFlags> = {};
+    for (const entry of raw) {
+      if (typeof entry !== "object" || entry === null) continue;
+      const item = entry as { name?: unknown; type?: unknown };
+      if (typeof item.name !== "string") continue;
+      // Directories named like an artifact are not artifacts — same rule as
+      // the local scanner's `entry.isFile()` check.
+      if (item.type !== "file") continue;
+      const m = GATE_FILE.exec(item.name);
+      if (m === null) continue;
+      const [, feature, gate] = m;
+      const flags = (result[feature!] ??= {
+        spec: false,
+        interfaces: false,
+        plan: false,
+      });
+      flags[gate as keyof ArtifactFlags] = true;
+    }
+
+    lastGood = result;
+    return result;
+  }
+
+  return async () => {
+    try {
+      return await listArtifacts();
+    } catch {
+      // Belt and braces: the contract is "never throws", full stop.
+      return lastGood;
+    }
+  };
+}
+
+/**
+ * Branch names read from the PROJECT repo via the branches API.
+ *
+ * This replaces `defaultListBranches` when a GitHub repo is configured, fixing
+ * a real incoherence: the local default ran `git for-each-ref` in the
+ * DASHBOARD's own cwd, which is only the monitored project by coincidence.
+ * Same resilience contract as the PR source: never throws, last-known-good
+ * (initially `[]`) on any failure, `onError` as the operator signal.
+ */
+export function createGithubBranchSource(
+  opts: GithubOptions,
+): () => Promise<string[]> {
+  const doFetch = opts.fetch ?? fetch;
+  const headers = buildHeaders(opts.token);
+  const report = makeReporter(opts.onError);
+  const url = `${API_ROOT}/repos/${opts.repo}/branches?per_page=${PER_PAGE}`;
+
+  let lastGood: string[] = [];
+
+  async function listBranches(): Promise<string[]> {
+    let raw: unknown;
+    try {
+      const res = await doFetch(url, { headers });
+      if (!res.ok) {
+        report({ status: res.status, message: `GitHub returned ${res.status}` });
+        return lastGood;
+      }
+      raw = await res.json();
+    } catch (e) {
+      report({ message: (e as Error)?.message ?? "request failed" });
+      return lastGood;
+    }
+    if (!Array.isArray(raw)) {
+      report({ message: "branches response is not an array" });
+      return lastGood;
+    }
+
+    const names: string[] = [];
+    for (const entry of raw) {
+      if (typeof entry !== "object" || entry === null) continue;
+      const name = (entry as { name?: unknown }).name;
+      if (typeof name === "string" && name.length > 0) names.push(name);
+    }
+
+    lastGood = names;
+    return names;
+  }
+
+  return async () => {
+    try {
+      return await listBranches();
+    } catch {
+      return lastGood;
+    }
+  };
+}
+
 /**
  * Raw API entry → `Pull`, or null when it isn't a usable feature PR.
  *
