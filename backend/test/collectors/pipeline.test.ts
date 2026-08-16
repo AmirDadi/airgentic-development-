@@ -301,3 +301,64 @@ describe("features with no artifacts at all", () => {
     expect(listFeatures(db)).toEqual([]);
   });
 });
+
+describe("injected listArtifacts (GitHub-sourced gates)", () => {
+  const flags = (over: Partial<{ spec: boolean; interfaces: boolean; plan: boolean }> = {}) => ({
+    spec: false,
+    interfaces: false,
+    plan: false,
+    ...over,
+  });
+
+  it("derives features and stages from listArtifacts, never touching specsDir", async () => {
+    await collectPipeline(
+      db,
+      opts({
+        // A path that does not exist: if the local scan ran, it would find
+        // nothing; the point is that listArtifacts replaces it entirely.
+        specsDir: join(dir, "does-not-exist"),
+        listArtifacts: async () => ({
+          checkout: flags({ spec: true, interfaces: true }),
+          "web-lead.v2": flags({ spec: true, interfaces: true, plan: true }),
+        }),
+      }),
+    );
+    const rows = listFeatures(db);
+    expect(rows.map((f) => f.name)).toEqual(["checkout", "web-lead.v2"]);
+    expect(rows.find((f) => f.name === "checkout")!.stage).toBe("interfaces");
+    expect(rows.find((f) => f.name === "web-lead.v2")!.stage).toBe("plan");
+  });
+
+  it("ignores local gate files when listArtifacts is provided", async () => {
+    await artifact("local-only", "spec");
+    await collectPipeline(
+      db,
+      opts({ listArtifacts: async () => ({ remote: flags({ spec: true }) }) }),
+    );
+    expect(listFeatures(db).map((f) => f.name)).toEqual(["remote"]);
+  });
+
+  it("unions listArtifacts features with branches and PRs exactly like local files", async () => {
+    await collectPipeline(
+      db,
+      opts({
+        specsDir: join(dir, "does-not-exist"),
+        listArtifacts: async () => ({
+          a: flags({ spec: true, interfaces: true, plan: true }),
+        }),
+        listBranches: async () => ["feat/a", "feat/branch-only", "main"],
+        listPrs: async () => ({ "pr-only": pr({ state: "merged" }) }),
+      }),
+    );
+    const rows = listFeatures(db);
+    expect(rows.map((f) => f.name).sort()).toEqual(["a", "branch-only", "pr-only"]);
+    expect(rows.find((f) => f.name === "a")!.stage).toBe("implementing");
+    expect(rows.find((f) => f.name === "pr-only")!.stage).toBe("merged");
+  });
+
+  it("without listArtifacts the local scan still runs (unchanged behaviour)", async () => {
+    await artifact("checkout", "spec");
+    await collectPipeline(db, opts());
+    expect(listFeatures(db).map((f) => f.name)).toEqual(["checkout"]);
+  });
+});

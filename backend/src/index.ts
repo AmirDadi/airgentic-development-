@@ -29,8 +29,21 @@
  *                       IN MEMORY, so a restart logs everyone out. Over plain
  *                       HTTP the token still travels in the clear: this is a
  *                       lock on the door, not a replacement for TLS/Tailscale.
- *   SPECS_DIR           Directory scanned for `<feature>.{spec,interfaces,plan}.md`.
- *                       Default "specs".
+ *   GITHUB_REPO         "owner/repo" of the PROJECT repo. When set, ALL THREE
+ *                       pipeline signals come from it: gate artifacts via the
+ *                       contents API, branches via the branches API, PRs via
+ *                       the pulls API. Unset = local fallback mode (SPECS_DIR
+ *                       scan + local git, no PR signal).
+ *   GITHUB_TOKEN        PAT for the GitHub API. Omit for a public repo.
+ *   SPECS_REPO_PATH     Directory INSIDE the GitHub repo holding the gate
+ *                       artifacts. Default "specs". Only used with GITHUB_REPO.
+ *   SPECS_REF           Branch/ref the gate artifacts are read from. Default
+ *                       "main" — set it when the repo's default branch is
+ *                       anything else. Only used with GITHUB_REPO.
+ *   SPECS_DIR           LOCAL fallback directory scanned for
+ *                       `<feature>.{spec,interfaces,plan}.md` when GITHUB_REPO
+ *                       is unset. Default "specs". Ignored when GITHUB_REPO is
+ *                       set — the repo is then the source of truth for specs.
  *   TRANSCRIPT_SOURCES  JSON array of {agent, path, sessionId} transcripts to
  *                       tail. Default none — the board still shows agents and
  *                       features without it. Invalid JSON is ignored (logged).
